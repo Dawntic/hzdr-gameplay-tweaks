@@ -2,11 +2,12 @@
 #include <emmintrin.h>
 #include <Windows.h>
 
+
+
 namespace Offsets::detail
 {
 	static std::vector<SignatureStorageWrapper *>& GetInitializationEntries()
 	{
-		// Has to be a function-local static to avoid initialization order issues
 		static std::vector<SignatureStorageWrapper *> entries;
 		return entries;
 	}
@@ -23,19 +24,11 @@ namespace Offsets::detail
 	{
 		PatternSpan longestRun = {};
 
-		// Scan forwards until we hit the first non-wildcard byte
-		//
-		// ? 86 ? 01 87 47 ? ? ? ? 48 ? ?
-		//   ^^
 		for (size_t i = 0; i < m_Signature.size(); i++)
 		{
 			if (m_Signature[i].Wildcard)
 				continue;
 
-			// Scan backwards until we hit the first non-wildcard byte
-			//
-			// ? 86 ? 01 87 47 ? ? ? ? 48 ? ?
-			//                         ^^
 			for (size_t j = m_Signature.size(); j-- > i;)
 			{
 				if (!m_Signature[j].Wildcard)
@@ -70,17 +63,13 @@ namespace Offsets::detail
 
 		const auto nonWildcardSubrange = FindLongestNonWildcardRun();
 
-		if (nonWildcardSubrange.empty()) // if (all wildcards)
+		if (nonWildcardSubrange.empty())
 			return Region.begin();
 
 		const auto subrangeAdjustment = nonWildcardSubrange.data() - m_Signature.data();
-		const auto scanStart = Region.begin() + subrangeAdjustment;					   // Seek forward to prevent underflow
-		const auto scanEnd = (Region.end() - m_Signature.size()) + subrangeAdjustment; // Seek backward to prevent overflow
+		const auto scanStart = Region.begin() + subrangeAdjustment;
+		const auto scanEnd = (Region.end() - m_Signature.size()) + subrangeAdjustment;
 
-		// Linear vectorized search. Turns out CPUs are 2-4x faster at this than Boyer-Moore-Horspool.
-		//
-		// Unrolled version of http://0x80.pl/articles/simd-strfind.html#generic-sse-avx2 since AVX2 support
-		// can't be assumed. iterCount is used to avoid three extra branches per loop instead of comparing pos.
 		auto pos = scanStart;
 
 		const ptrdiff_t perIterSize = sizeof(__m128i) * 2;
@@ -104,8 +93,6 @@ namespace Offsets::detail
 		{
 			auto mask = loadMask(0) | loadMask(1);
 
-			// The indices of 1-bits in mask map to indices of byte matches in pos. Each iteration finds the
-			// lowest (LSB) index of a 1-bit in mask, clears it, and tests the full signature at that index.
 			while (mask != 0) [[unlikely]]
 			{
 				const auto bitIndex = _tzcnt_u32(mask);
@@ -126,6 +113,146 @@ namespace Offsets::detail
 	}
 }
 
+#include <filesystem>
+#include "test.h"
+RENDERDOC_API_1_7_0 *renderDocApi = nullptr;
+void LoadRenderDoc()
+{
+	std::filesystem::path renderdocPath = L"C:\\Program Files\\RenderDoc\\renderdoc.dll";
+
+	if (!std::filesystem::exists(renderdocPath))
+	{
+		spdlog::debug("[RenderDoc] renderdoc.dll not found at: {}", renderdocPath.string());
+		return;
+	}
+
+	HMODULE renderDocModule = LoadLibraryW(renderdocPath.wstring().c_str());
+	spdlog::debug("[RenderDoc] Attempting to load renderdoc.dll from {}", renderdocPath.string());
+
+	if (!renderDocModule)
+	{
+		spdlog::debug("[RenderDoc] Failed to load renderdoc.dll");
+		return;
+	}
+
+	spdlog::info("[RenderDoc] Loaded renderdoc.dll from {}", renderdocPath.string());
+
+	auto RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)GetProcAddress(renderDocModule, "RENDERDOC_GetAPI");
+	if (!RENDERDOC_GetAPI)
+	{
+		spdlog::info("[RenderDoc] Failed to get RENDERDOC_GetAPI");
+		FreeLibrary(renderDocModule);
+		return;
+	}
+
+	int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_7_0, (void **)&renderDocApi);
+	if (ret != 1 || !renderDocApi)
+	{
+		spdlog::info("[RenderDoc] Failed to get API interface");
+		FreeLibrary(renderDocModule);
+		renderDocApi = nullptr;
+		return;
+	}
+
+	std::filesystem::path captureDir = L"C:\\Users\\RG\\Desktop\\HZD_Render_Caps";
+	std::filesystem::create_directories(captureDir);
+	renderDocApi->SetCaptureFilePathTemplate((captureDir / "capture").string().c_str());
+	spdlog::info("[RenderDoc] Capture path set to {}", (captureDir / "capture").string());
+}
+
+
+
+
+
+#include <d3d12.h>
+static decltype(&D3D12CreateDevice) OrigD3D12CreateDevice = nullptr;
+
+static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice)
+{
+	spdlog::info("[RenderDoc] D3D12CreateDevice called");
+	return OrigD3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+}
+
+/*
+DECLARE_HOOK_TRANSACTION(D3D12CreateDevice)
+{
+	HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
+	if (!hD3D12)
+	{
+		spdlog::warn("[RenderDoc] d3d12.dll not loaded yet... skipping hook");
+		return true; // non-fatal, don't abort the transaction
+	}
+
+	auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hD3D12, "D3D12CreateDevice"));
+	if (!addr)
+	{
+		spdlog::warn("[RenderDoc] D3D12CreateDevice not found... skipping hook");
+		return true; // non-fatal
+	}
+
+	return Hooks::WriteJump(addr, &HookedD3D12CreateDevice, reinterpret_cast<void **>(&OrigD3D12CreateDevice));
+};
+*/
+
+
+#include <detours/detours.h>
+
+static decltype(&LoadLibraryExW) OrigLoadLibraryExW = nullptr;
+
+static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
+{
+	HMODULE hMod = OrigLoadLibraryExW(lpLibFileName, hFile, dwFlags);
+
+	if (lpLibFileName)
+	{
+		auto name = std::filesystem::path(lpLibFileName).filename().wstring();
+		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+		//spdlog::info("[LoadLibrary] {}", std::filesystem::path(lpLibFileName).filename().string());
+
+		if (name == L"d3d12.dll" || name == L"d3d12core.dll")
+		{
+			spdlog::info("[RenderDoc] {} just loaded — applying hook", std::filesystem::path(lpLibFileName).filename().string());
+
+			auto addr = GetProcAddress(hMod, "D3D12CreateDevice");
+			if (addr)
+			{
+				OrigD3D12CreateDevice = reinterpret_cast<decltype(&D3D12CreateDevice)>(addr);
+				DetourTransactionBegin();
+				DetourUpdateThread(GetCurrentThread());
+				DetourAttach(reinterpret_cast<void **>(&OrigD3D12CreateDevice), &HookedD3D12CreateDevice);
+				if (DetourTransactionCommit() == NO_ERROR)
+					spdlog::info("[RenderDoc] D3D12CreateDevice hooked in {}", std::filesystem::path(lpLibFileName).filename().string());
+			}
+			else
+			{
+				spdlog::warn(
+					"[RenderDoc] D3D12CreateDevice not exported from {}",
+					std::filesystem::path(lpLibFileName).filename().string());
+			}
+		}
+	}
+
+	return hMod;
+}
+
+DECLARE_HOOK_TRANSACTION(LoadLibraryExW)
+{
+	return Hooks::WriteJump(
+		reinterpret_cast<uintptr_t>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW")),
+		&HookedLoadLibraryExW,
+		reinterpret_cast<void **>(&OrigLoadLibraryExW));
+};
+
+
+
+
+
+
+
+
+
+
+
 namespace Offsets
 {
 	using namespace detail;
@@ -134,12 +261,12 @@ namespace Offsets
 	{
 		spdlog::info("{}():", __FUNCTION__);
 
+		//LoadRenderDoc();
+
 		auto dosHeader = reinterpret_cast<const PIMAGE_DOS_HEADER>(GetModuleHandleW(nullptr));
 		auto ntHeaders = reinterpret_cast<const PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(dosHeader) + dosHeader->e_lfanew);
 		auto region = ByteSpan { reinterpret_cast<const uint8_t *>(dosHeader), ntHeaders->OptionalHeader.SizeOfImage };
 
-		// Intialize() may be called from DllMain() which holds the loader lock. New threads can't be spawned as
-		// long as the loader lock is held. Therefore parallelization is impossible.
 		auto entries = std::move(GetInitializationEntries());
 
 		std::for_each(

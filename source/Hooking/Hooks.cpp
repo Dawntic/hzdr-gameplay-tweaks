@@ -2,6 +2,7 @@
 #include <detours/detours.h>
 #include "Memory.h"
 
+
 namespace Hooks
 {
 	struct CallbackEntry
