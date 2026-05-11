@@ -1,7 +1,13 @@
 #include <execution>
 #include <emmintrin.h>
-#include <Windows.h>
 
+
+
+#define WIN32_NO_STATUS
+#include <Windows.h>
+#undef WIN32_NO_STATUS
+#include <ntstatus.h>
+#include <winternl.h>
 
 
 namespace Offsets::detail
@@ -194,9 +200,10 @@ DECLARE_HOOK_TRANSACTION(D3D12CreateDevice)
 };
 */
 
-
+#include "tlhelp32.h"
 #include <detours/detours.h>
 
+/*
 static decltype(&LoadLibraryExW) OrigLoadLibraryExW = nullptr;
 
 static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
@@ -207,27 +214,19 @@ static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, 
 	{
 		auto name = std::filesystem::path(lpLibFileName).filename().wstring();
 		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
-		//spdlog::info("[LoadLibrary] {}", std::filesystem::path(lpLibFileName).filename().string());
+		spdlog::info("[LoadLibrary] {}", std::filesystem::path(lpLibFileName).filename().string());
 
-		if (name == L"d3d12.dll" || name == L"d3d12core.dll")
-		{
-			spdlog::info("[RenderDoc] {} just loaded — applying hook", std::filesystem::path(lpLibFileName).filename().string());
-
-			auto addr = GetProcAddress(hMod, "D3D12CreateDevice");
-			if (addr)
+		if (name == L"d3d12core.dll"){
+			spdlog::info("[RenderDoc] D3D12Core.dll exports:");
+			auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hMod);
+			auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(hMod) + dos->e_lfanew);
+			auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+			if (dir.VirtualAddress)
 			{
-				OrigD3D12CreateDevice = reinterpret_cast<decltype(&D3D12CreateDevice)>(addr);
-				DetourTransactionBegin();
-				DetourUpdateThread(GetCurrentThread());
-				DetourAttach(reinterpret_cast<void **>(&OrigD3D12CreateDevice), &HookedD3D12CreateDevice);
-				if (DetourTransactionCommit() == NO_ERROR)
-					spdlog::info("[RenderDoc] D3D12CreateDevice hooked in {}", std::filesystem::path(lpLibFileName).filename().string());
-			}
-			else
-			{
-				spdlog::warn(
-					"[RenderDoc] D3D12CreateDevice not exported from {}",
-					std::filesystem::path(lpLibFileName).filename().string());
+				auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uintptr_t>(hMod) + dir.VirtualAddress);
+				auto names = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(hMod) + exports->AddressOfNames);
+				for (uint32_t i = 0; i < exports->NumberOfNames; i++)
+					spdlog::info("  {}", reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(hMod) + names[i]));
 			}
 		}
 	}
@@ -235,15 +234,121 @@ static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, 
 	return hMod;
 }
 
+
 DECLARE_HOOK_TRANSACTION(LoadLibraryExW)
 {
+	// Check if d3d12 is already loaded
+	for (const wchar_t *dll : { L"d3d12.dll", L"D3D12Core.dll" })
+	{
+		HMODULE hMod = GetModuleHandleW(dll);
+		spdlog::info("[RenderDoc] {} at startup: {:p}", std::filesystem::path(dll).filename().string(), static_cast<void *>(hMod));
+
+		if (hMod)
+		{
+			auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hMod, "D3D12CreateDevice"));
+			if (addr)
+			{
+				// Already inside the transaction — WriteJump adds to it directly
+				Hooks::WriteJump(addr, &HookedD3D12CreateDevice, reinterpret_cast<void **>(&OrigD3D12CreateDevice));
+				spdlog::info("[RenderDoc] Queued D3D12CreateDevice hook in {}", std::filesystem::path(dll).filename().string());
+			}
+		}
+	}
+
+	// Module snapshot
+	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+	MODULEENTRY32W me { .dwSize = sizeof(me) };
+	if (Module32FirstW(hSnap, &me))
+	{
+		do
+		{
+			spdlog::info("[Modules] {}", std::filesystem::path(me.szExePath).string());
+		} while (Module32NextW(hSnap, &me));
+	}
+	CloseHandle(hSnap);
+
 	return Hooks::WriteJump(
 		reinterpret_cast<uintptr_t>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW")),
 		&HookedLoadLibraryExW,
 		reinterpret_cast<void **>(&OrigLoadLibraryExW));
 };
+*/
 
 
+// ntdll LdrLoadDll signature
+using LdrLoadDll_t = NTSTATUS(NTAPI *)(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle);
+
+static LdrLoadDll_t OrigLdrLoadDll = nullptr;
+
+static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle)
+{
+	NTSTATUS status = OrigLdrLoadDll(SearchPath, LoadFlags, Name, ModuleHandle);
+
+	if (Name && Name->Buffer && Name->Length > 0)
+	{
+		// Copy to std::wstring so we have a null-terminated string
+		std::wstring fullName(Name->Buffer, Name->Length / sizeof(wchar_t));
+		auto pos = fullName.rfind(L'\\');
+		std::wstring filename = (pos != std::wstring::npos) ? fullName.substr(pos + 1) : fullName;
+
+		spdlog::info("[LdrLoadDll] {}", std::filesystem::path(filename).string());
+
+		if (_wcsicmp(filename.c_str(), L"d3d12.dll") == 0 || _wcsicmp(filename.c_str(), L"D3D12Core.dll") == 0)
+		{
+			spdlog::info("[RenderDoc] *** {} loading ***", std::filesystem::path(filename).string());
+			/*
+			if (ModuleHandle && *ModuleHandle)
+			{
+				HMODULE hMod = static_cast<HMODULE>(*ModuleHandle);
+				auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hMod, "D3D12CreateDevice"));
+
+				if (addr)
+				{
+					OrigD3D12CreateDevice = reinterpret_cast<decltype(&D3D12CreateDevice)>(addr);
+					DetourTransactionBegin();
+					DetourUpdateThread(GetCurrentThread());
+					DetourAttach(reinterpret_cast<void **>(&OrigD3D12CreateDevice), &HookedD3D12CreateDevice);
+					DetourTransactionCommit();
+					spdlog::info("[RenderDoc] D3D12CreateDevice hooked in {}", std::filesystem::path(filename).string());
+				}
+				else
+				{
+					spdlog::warn("[RenderDoc] D3D12CreateDevice not exported from {}", std::filesystem::path(filename).string());
+				}
+			}
+			*/
+		}
+	}
+
+	return status;
+}
+
+DECLARE_HOOK_TRANSACTION(LdrLoadDll)
+{
+	HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
+	HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
+	OutputDebugStringW(
+		hD3D12 ? L"d3d12.dll ALREADY loaded in DECLARE_HOOK_TRANSACTION\n" : L"d3d12.dll not loaded yet in Offsets::DECLARE_HOOK_TRANSACTION\n");
+	OutputDebugStringW(
+		hD3D12Core ? L"D3D12Core.dll ALREADY loaded in Offsets::DECLARE_HOOK_TRANSACTION\n" : L"D3D12Core.dll not loaded yet in Offsets::DECLARE_HOOK_TRANSACTION\n");
+
+	// Hook LdrLoadDll to catch anything that loads afterward
+	HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+	if (!hNtdll)
+	{
+		spdlog::warn("[RenderDoc] ntdll.dll not found");
+		return true;
+	}
+
+	auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hNtdll, "LdrLoadDll"));
+	if (!addr)
+	{
+		spdlog::warn("[RenderDoc] LdrLoadDll not found in ntdll");
+		return true;
+	}
+
+	return Hooks::WriteJump(addr, &HookedLdrLoadDll, reinterpret_cast<void **>(&OrigLdrLoadDll));
+};
 
 
 
@@ -262,6 +367,10 @@ namespace Offsets
 		spdlog::info("{}():", __FUNCTION__);
 
 		//LoadRenderDoc();
+		HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
+		HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
+		OutputDebugStringW(hD3D12 ? L"d3d12.dll ALREADY loaded in Offsets::Initialize\n" : L"d3d12.dll not loaded yet in Offsets::Initialize\n");
+		OutputDebugStringW(hD3D12Core ? L"D3D12Core.dll ALREADY loaded in Offsets::Initialize\n" : L"D3D12Core.dll not loaded yet in Offsets::Initialize\n");
 
 		auto dosHeader = reinterpret_cast<const PIMAGE_DOS_HEADER>(GetModuleHandleW(nullptr));
 		auto ntHeaders = reinterpret_cast<const PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(dosHeader) + dosHeader->e_lfanew);

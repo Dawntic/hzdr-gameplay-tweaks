@@ -5,6 +5,8 @@
 #include "NxD3DImpl.h"
 #include "NxDXGIImpl.h"
 
+#include <Windows.h>
+
 namespace HRZR
 {
 	bool (*OriginalPresent)(NxDXGIImpl *DXGIImpl, void *a2);
@@ -39,6 +41,14 @@ namespace HRZR
 
 	DECLARE_HOOK_TRANSACTION(NxDXGIImpl)
 	{
+		HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
+		HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
+		OutputDebugStringW(
+			hD3D12 ? L"d3d12.dll ALREADY loaded in HookedPresent\n" : L"d3d12.dll not loaded yet in HookedPresent\n");
+		OutputDebugStringW(
+			hD3D12Core ? L"D3D12Core.dll ALREADY loaded in HookedPresent\n"
+					   : L"D3D12Core.dll not loaded yet in HookedPresent\n");
+
 		// Present vfunc is 10th index in NxDXGIImpl's virtual table
 		const auto vtableEntryNxDXGIImpl = Offsets::Signature(
 										 "48 8D 0D ? ? ? ? 66 89 68 08 48 89 08 40 88 68 0A 48 89 68 0C 48 89 68 18 48 89 68 20")
