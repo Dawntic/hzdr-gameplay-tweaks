@@ -124,6 +124,12 @@ namespace Offsets::detail
 RENDERDOC_API_1_7_0 *renderDocApi = nullptr;
 void LoadRenderDoc()
 {
+	if (renderDocApi)
+	{
+		spdlog::debug("[RenderDoc] Already initialized, skipping");
+		return;
+	}
+
 	std::filesystem::path renderdocPath = L"C:\\Program Files\\RenderDoc\\renderdoc.dll";
 
 	if (!std::filesystem::exists(renderdocPath))
@@ -167,113 +173,49 @@ void LoadRenderDoc()
 }
 
 
-
-
-
 #include <d3d12.h>
 static decltype(&D3D12CreateDevice) OrigD3D12CreateDevice = nullptr;
-
 static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice)
 {
 	spdlog::info("[RenderDoc] D3D12CreateDevice called");
-	return OrigD3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+
+	HRESULT hr = OrigD3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+
+	if (SUCCEEDED(hr) && ppDevice && *ppDevice)
+	{
+		// The first field of any COM object is its vtable pointer.
+		// If RenderDoc wrapped the device, the vtable entries will
+		// point into renderdoc.dll. If not, they point into d3d12.dll.
+		void **vtable = *reinterpret_cast<void ***>(*ppDevice);
+
+		// Check the first few vtable slots
+		for (int i = 0; i < 4; i++)
+		{
+			HMODULE hOwner = nullptr;
+			GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(vtable[i]),
+				&hOwner);
+
+			wchar_t modName[MAX_PATH] {};
+			GetModuleFileNameW(hOwner, modName, MAX_PATH);
+
+			spdlog::info(
+				"[RenderDoc] Device vtable[{}] = {:p} owned by {}",
+				i,
+				vtable[i],
+				std::filesystem::path(modName).filename().string());
+		}
+
+		// If any slot says renderdoc.dll — RenderDoc hooked it
+		// If all slots say d3d12.dll or D3D12Core.dll — RenderDoc missed it
+	}
+
+	return hr;
 }
-
-/*
-DECLARE_HOOK_TRANSACTION(D3D12CreateDevice)
-{
-	HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
-	if (!hD3D12)
-	{
-		spdlog::warn("[RenderDoc] d3d12.dll not loaded yet... skipping hook");
-		return true; // non-fatal, don't abort the transaction
-	}
-
-	auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hD3D12, "D3D12CreateDevice"));
-	if (!addr)
-	{
-		spdlog::warn("[RenderDoc] D3D12CreateDevice not found... skipping hook");
-		return true; // non-fatal
-	}
-
-	return Hooks::WriteJump(addr, &HookedD3D12CreateDevice, reinterpret_cast<void **>(&OrigD3D12CreateDevice));
-};
-*/
 
 #include "tlhelp32.h"
 #include <detours/detours.h>
-
-/*
-static decltype(&LoadLibraryExW) OrigLoadLibraryExW = nullptr;
-
-static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags)
-{
-	HMODULE hMod = OrigLoadLibraryExW(lpLibFileName, hFile, dwFlags);
-
-	if (lpLibFileName)
-	{
-		auto name = std::filesystem::path(lpLibFileName).filename().wstring();
-		std::transform(name.begin(), name.end(), name.begin(), ::towlower);
-		spdlog::info("[LoadLibrary] {}", std::filesystem::path(lpLibFileName).filename().string());
-
-		if (name == L"d3d12core.dll"){
-			spdlog::info("[RenderDoc] D3D12Core.dll exports:");
-			auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hMod);
-			auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(hMod) + dos->e_lfanew);
-			auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-			if (dir.VirtualAddress)
-			{
-				auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uintptr_t>(hMod) + dir.VirtualAddress);
-				auto names = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(hMod) + exports->AddressOfNames);
-				for (uint32_t i = 0; i < exports->NumberOfNames; i++)
-					spdlog::info("  {}", reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(hMod) + names[i]));
-			}
-		}
-	}
-
-	return hMod;
-}
-
-
-DECLARE_HOOK_TRANSACTION(LoadLibraryExW)
-{
-	// Check if d3d12 is already loaded
-	for (const wchar_t *dll : { L"d3d12.dll", L"D3D12Core.dll" })
-	{
-		HMODULE hMod = GetModuleHandleW(dll);
-		spdlog::info("[RenderDoc] {} at startup: {:p}", std::filesystem::path(dll).filename().string(), static_cast<void *>(hMod));
-
-		if (hMod)
-		{
-			auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hMod, "D3D12CreateDevice"));
-			if (addr)
-			{
-				// Already inside the transaction — WriteJump adds to it directly
-				Hooks::WriteJump(addr, &HookedD3D12CreateDevice, reinterpret_cast<void **>(&OrigD3D12CreateDevice));
-				spdlog::info("[RenderDoc] Queued D3D12CreateDevice hook in {}", std::filesystem::path(dll).filename().string());
-			}
-		}
-	}
-
-	// Module snapshot
-	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-	MODULEENTRY32W me { .dwSize = sizeof(me) };
-	if (Module32FirstW(hSnap, &me))
-	{
-		do
-		{
-			spdlog::info("[Modules] {}", std::filesystem::path(me.szExePath).string());
-		} while (Module32NextW(hSnap, &me));
-	}
-	CloseHandle(hSnap);
-
-	return Hooks::WriteJump(
-		reinterpret_cast<uintptr_t>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryExW")),
-		&HookedLoadLibraryExW,
-		reinterpret_cast<void **>(&OrigLoadLibraryExW));
-};
-*/
-
 
 // ntdll LdrLoadDll signature
 using LdrLoadDll_t = NTSTATUS(NTAPI *)(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle);
@@ -291,12 +233,14 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 		auto pos = fullName.rfind(L'\\');
 		std::wstring filename = (pos != std::wstring::npos) ? fullName.substr(pos + 1) : fullName;
 
-		spdlog::info("[LdrLoadDll] {}", std::filesystem::path(filename).string());
+		//spdlog::info("[LdrLoadDll] {}", std::filesystem::path(filename).string());
 
 		if (_wcsicmp(filename.c_str(), L"d3d12.dll") == 0 || _wcsicmp(filename.c_str(), L"D3D12Core.dll") == 0)
 		{
 			spdlog::info("[RenderDoc] *** {} loading ***", std::filesystem::path(filename).string());
-			/*
+	
+			LoadRenderDoc();
+			
 			if (ModuleHandle && *ModuleHandle)
 			{
 				HMODULE hMod = static_cast<HMODULE>(*ModuleHandle);
@@ -316,7 +260,7 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 					spdlog::warn("[RenderDoc] D3D12CreateDevice not exported from {}", std::filesystem::path(filename).string());
 				}
 			}
-			*/
+			
 		}
 	}
 
