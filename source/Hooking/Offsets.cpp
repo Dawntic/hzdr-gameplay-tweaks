@@ -269,12 +269,14 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 
 DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 {
+	/*
 	HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
 	HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
 	OutputDebugStringW(
 		hD3D12 ? L"d3d12.dll ALREADY loaded in DECLARE_HOOK_TRANSACTION\n" : L"d3d12.dll not loaded yet in Offsets::DECLARE_HOOK_TRANSACTION\n");
 	OutputDebugStringW(
 		hD3D12Core ? L"D3D12Core.dll ALREADY loaded in Offsets::DECLARE_HOOK_TRANSACTION\n" : L"D3D12Core.dll not loaded yet in Offsets::DECLARE_HOOK_TRANSACTION\n");
+	*/
 
 	// Hook LdrLoadDll to catch anything that loads afterward
 	HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
@@ -298,10 +300,6 @@ DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 
 
 
-
-
-
-
 namespace Offsets
 {
 	using namespace detail;
@@ -309,12 +307,6 @@ namespace Offsets
 	bool Initialize()
 	{
 		spdlog::info("{}():", __FUNCTION__);
-
-		//LoadRenderDoc();
-		HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
-		HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
-		OutputDebugStringW(hD3D12 ? L"d3d12.dll ALREADY loaded in Offsets::Initialize\n" : L"d3d12.dll not loaded yet in Offsets::Initialize\n");
-		OutputDebugStringW(hD3D12Core ? L"D3D12Core.dll ALREADY loaded in Offsets::Initialize\n" : L"D3D12Core.dll not loaded yet in Offsets::Initialize\n");
 
 		auto dosHeader = reinterpret_cast<const PIMAGE_DOS_HEADER>(GetModuleHandleW(nullptr));
 		auto ntHeaders = reinterpret_cast<const PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(dosHeader) + dosHeader->e_lfanew);

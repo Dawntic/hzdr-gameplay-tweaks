@@ -41,13 +41,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
 	if (fdwReason == DLL_PROCESS_ATTACH)
 	{
-		// Check if d3d12 is already loaded at this earliest possible point
-		HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
-		HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
-		OutputDebugStringW(hD3D12 ? L"d3d12.dll ALREADY loaded in RawDllMain\n" : L"d3d12.dll not loaded yet in RawDllMain\n");
-		OutputDebugStringW(hD3D12Core ? L"D3D12Core.dll ALREADY loaded in RawDllMain\n" : L"D3D12Core.dll not loaded yet in RawDllMain\n");
-
-
 		// It's extremely unlikely that a path will be this long, but it's a one time check, so who cares.
 		std::wstring fullModulePath(8192, '\0');
 		uint32_t len = GetModuleFileNameW(GetModuleHandleW(nullptr), fullModulePath.data(), static_cast<DWORD>(fullModulePath.size()));
@@ -69,7 +62,8 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
 			swprintf_s(
 				buffer.data(),
 				buffer.size(),
-				L"An exception has occurred on startup: %hs\n\nFailed to initialize HZDR Gameplay Tweaks and Cheat Menu.\n\nExecutable path: %ws",
+				L"An exception has occurred on startup: %hs\n\nFailed to initialize HZDR Gameplay Tweaks and Cheat Menu.\n\nExecutable "
+				L"path: %ws",
 				e.what(),
 				fullModulePath.c_str());
 

@@ -7,12 +7,6 @@ namespace HRZR::DebugUI
 {
 	void TriggerCapture()
 	{
-		HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
-		HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
-		OutputDebugStringW(hD3D12 ? L"d3d12.dll ALREADY loaded in Menu\n" : L"d3d12.dll not loaded yet in Menu\n");
-		OutputDebugStringW(
-			hD3D12Core ? L"D3D12Core.dll ALREADY loaded in Menu\n" : L"D3D12Core.dll not loaded yet in Menu\n");
-
 		if (!renderDocApi)
 		{
 			spdlog::warn("[RenderDoc] Cannot trigger capture - RenderDoc API not available");
