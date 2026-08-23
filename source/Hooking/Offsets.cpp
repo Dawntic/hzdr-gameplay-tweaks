@@ -122,13 +122,16 @@ namespace Offsets::detail
 #include <filesystem>
 #include "test.h"
 RENDERDOC_API_1_7_0 *renderDocApi = nullptr;
+std::atomic_bool g_wantCapture = false;
 void LoadRenderDoc()
 {
-	if (renderDocApi)
-	{
-		spdlog::debug("[RenderDoc] Already initialized, skipping");
-		return;
-	}
+	// bool s_loading = false;
+	//if (s_loading || renderDocApi)
+	//{
+	//	spdlog::debug("[RenderDoc] Already initialized, skipping");
+	//	return;
+	//}
+	//s_loading = true;
 
 	std::filesystem::path renderdocPath = L"C:\\Program Files\\RenderDoc\\renderdoc.dll";
 
@@ -179,13 +182,12 @@ static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LE
 {
 	spdlog::info("[RenderDoc] D3D12CreateDevice called");
 
+	OutputDebugStringW(L"------D3D12CreateDevice Called------------------------");
+
 	HRESULT hr = OrigD3D12CreateDevice(pAdapter, MinimumFeatureLevel, riid, ppDevice);
 
 	if (SUCCEEDED(hr) && ppDevice && *ppDevice)
 	{
-		// The first field of any COM object is its vtable pointer.
-		// If RenderDoc wrapped the device, the vtable entries will
-		// point into renderdoc.dll. If not, they point into d3d12.dll.
 		void **vtable = *reinterpret_cast<void ***>(*ppDevice);
 
 		// Check the first few vtable slots
@@ -206,9 +208,6 @@ static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LE
 				vtable[i],
 				std::filesystem::path(modName).filename().string());
 		}
-
-		// If any slot says renderdoc.dll — RenderDoc hooked it
-		// If all slots say d3d12.dll or D3D12Core.dll — RenderDoc missed it
 	}
 
 	return hr;
@@ -221,27 +220,34 @@ static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LE
 using LdrLoadDll_t = NTSTATUS(NTAPI *)(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle);
 
 static LdrLoadDll_t OrigLdrLoadDll = nullptr;
-
 static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle)
 {
 	NTSTATUS status = OrigLdrLoadDll(SearchPath, LoadFlags, Name, ModuleHandle);
 
 	if (Name && Name->Buffer && Name->Length > 0)
 	{
-		// Copy to std::wstring so we have a null-terminated string
 		std::wstring fullName(Name->Buffer, Name->Length / sizeof(wchar_t));
 		auto pos = fullName.rfind(L'\\');
 		std::wstring filename = (pos != std::wstring::npos) ? fullName.substr(pos + 1) : fullName;
 
-		//spdlog::info("[LdrLoadDll] {}", std::filesystem::path(filename).string());
+		std::wstring test = L"Loading: " + filename;
+		OutputDebugStringW(test.c_str());
 
-		if (_wcsicmp(filename.c_str(), L"d3d12.dll") == 0 || _wcsicmp(filename.c_str(), L"D3D12Core.dll") == 0)
+				/*
+		static bool RDLoaded = false;
+		if (!RDLoaded)
 		{
-			spdlog::info("[RenderDoc] *** {} loading ***", std::filesystem::path(filename).string());
-	
-			LoadRenderDoc();
-			
-			if (ModuleHandle && *ModuleHandle)
+			RDLoaded = true;
+			LoadRenderDoc();			
+		}
+
+		if (_wcsicmp(filename.c_str(), L"d3d12.dll") == 0)
+		{
+			spdlog::info("[RenderDoc] D3D12.dll loading", std::filesystem::path(filename).string());
+			OutputDebugStringW(L"Loading:  D3D12.dll");
+			// Hook D3D12CreateDevice once — separate guard here
+			static bool s_d3d12Hooked = false;
+			if (!s_d3d12Hooked && ModuleHandle && *ModuleHandle)
 			{
 				HMODULE hMod = static_cast<HMODULE>(*ModuleHandle);
 				auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hMod, "D3D12CreateDevice"));
@@ -253,6 +259,7 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 					DetourUpdateThread(GetCurrentThread());
 					DetourAttach(reinterpret_cast<void **>(&OrigD3D12CreateDevice), &HookedD3D12CreateDevice);
 					DetourTransactionCommit();
+					s_d3d12Hooked = true;
 					spdlog::info("[RenderDoc] D3D12CreateDevice hooked in {}", std::filesystem::path(filename).string());
 				}
 				else
@@ -260,12 +267,40 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 					spdlog::warn("[RenderDoc] D3D12CreateDevice not exported from {}", std::filesystem::path(filename).string());
 				}
 			}
-			
 		}
+
+
+		if (_wcsicmp(filename.c_str(), L"D3D12Core.dll") == 0)
+		{
+			spdlog::info("[RenderDoc] D3D12Core.dll loading");
+
+			if (ModuleHandle && *ModuleHandle)
+			{
+				HMODULE hMod = static_cast<HMODULE>(*ModuleHandle);
+
+				// Enumerate exports to find the real device creation function
+				auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hMod);
+				auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(hMod) + dos->e_lfanew);
+				auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+
+				if (dir.VirtualAddress)
+				{
+					auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uintptr_t>(hMod) + dir.VirtualAddress);
+					auto names = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(hMod) + exports->AddressOfNames);
+
+					spdlog::info("[RenderDoc] D3D12Core.dll exports:");
+					for (uint32_t i = 0; i < exports->NumberOfNames; i++)
+						spdlog::info("  {}", reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(hMod) + names[i]));
+				}
+			}
+		}
+		*/
+		
 	}
 
 	return status;
 }
+
 
 DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 {
@@ -280,22 +315,11 @@ DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 
 	// Hook LdrLoadDll to catch anything that loads afterward
 	HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-	if (!hNtdll)
-	{
-		spdlog::warn("[RenderDoc] ntdll.dll not found");
-		return true;
-	}
 
 	auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hNtdll, "LdrLoadDll"));
-	if (!addr)
-	{
-		spdlog::warn("[RenderDoc] LdrLoadDll not found in ntdll");
-		return true;
-	}
 
 	return Hooks::WriteJump(addr, &HookedLdrLoadDll, reinterpret_cast<void **>(&OrigLdrLoadDll));
 };
-
 
 
 
@@ -307,6 +331,14 @@ namespace Offsets
 	bool Initialize()
 	{
 		spdlog::info("{}():", __FUNCTION__);
+
+		static bool RDLoaded = false;
+		if (!RDLoaded)
+		{
+			spdlog::info("Loading RenderDoc");
+			RDLoaded = true;
+			LoadRenderDoc();
+		}
 
 		auto dosHeader = reinterpret_cast<const PIMAGE_DOS_HEADER>(GetModuleHandleW(nullptr));
 		auto ntHeaders = reinterpret_cast<const PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(dosHeader) + dosHeader->e_lfanew);

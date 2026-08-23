@@ -5,6 +5,18 @@
 
 namespace HRZR::DebugUI
 {
+
+	void TriggerCapture()
+	{
+		if (!renderDocApi)
+		{
+			spdlog::warn("[RenderDoc] API not available");
+			return;
+		}
+		g_wantCapture.store(true);
+		spdlog::info("[RenderDoc] Capture queued for next NxDXGIImpl::Present");
+	}
+	/*
 	void TriggerCapture()
 	{
 		if (!renderDocApi)
@@ -51,6 +63,7 @@ namespace HRZR::DebugUI
 			}
 		}).detach();
 	}
+	*/
 
 	void LogWindow::Render()
 	{
