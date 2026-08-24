@@ -60,6 +60,7 @@ namespace InternalModConfig
 			bool TranslateAgsMarkers;
 			bool NameCommandLists;
 			bool LogCommandListNames;
+			bool EmitPassMarkers;
 			std::string DllPath;
 			std::string CapturePath;
 		} RenderDoc;
