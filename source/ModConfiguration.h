@@ -49,6 +49,16 @@ namespace InternalModConfig
 
 		bool ForceLeftAlignedCamera;
 
+		// [RenderDoc]
+		struct
+		{
+			bool Enable;
+			bool Diagnostics;
+			bool BypassStreamline;
+			std::string DllPath;
+			std::string CapturePath;
+		} RenderDoc;
+
 		// [Hotkeys]
 		struct
 		{

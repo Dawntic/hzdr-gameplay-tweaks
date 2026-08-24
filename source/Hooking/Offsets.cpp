@@ -1,8 +1,5 @@
 #include <execution>
 #include <emmintrin.h>
-
-
-
 #define WIN32_NO_STATUS
 #include <Windows.h>
 #undef WIN32_NO_STATUS
@@ -119,60 +116,113 @@ namespace Offsets::detail
 	}
 }
 
+#include <algorithm>
 #include <filesystem>
 #include "test.h"
+#include "ModConfiguration.h"
+#include "HRZR/RenderDocDiag.h"
 RENDERDOC_API_1_7_0 *renderDocApi = nullptr;
 std::atomic_bool g_wantCapture = false;
+
+// The engine has its own RenderDoc integration behind -attach_renderdoc (see the renderdoc.dll /
+// RENDERDOC_GetAPI / source:Tools/RenderDoc/renderdoc.dll strings in the executable). If that's in play we
+// must stay out of the way entirely: renderdoc.dll installs its API hooks from DllMain, so a second
+// LoadLibrary just bumps the refcount and returns the existing handle without re-hooking anything. Loading
+// it ourselves first would therefore *prevent* the engine's attach from ever hooking properly.
+bool EngineWillAttachRenderDoc()
+{
+	const auto rawCommandLine = GetCommandLineW();
+
+	if (!rawCommandLine)
+		return false;
+
+	std::wstring commandLine(rawCommandLine);
+	std::transform(commandLine.begin(), commandLine.end(), commandLine.begin(), ::towlower);
+
+	return commandLine.find(L"-attach_renderdoc") != std::wstring::npos;
+}
+
+static bool AcquireRenderDocApi(HMODULE Module)
+{
+	auto RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)GetProcAddress(Module, "RENDERDOC_GetAPI");
+
+	if (!RENDERDOC_GetAPI)
+	{
+		spdlog::warn("[RenderDoc] Failed to get RENDERDOC_GetAPI");
+		return false;
+	}
+
+	if (RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_7_0, (void **)&renderDocApi) != 1 || !renderDocApi)
+	{
+		spdlog::warn("[RenderDoc] Failed to get API interface");
+		renderDocApi = nullptr;
+		return false;
+	}
+
+	// Only override the capture template when explicitly configured, so we never clobber whatever the
+	// engine set up for itself.
+	if (!ModConfiguration.RenderDoc.CapturePath.empty())
+	{
+		const std::filesystem::path capturePath = ModConfiguration.RenderDoc.CapturePath;
+
+		std::error_code ec;
+		std::filesystem::create_directories(capturePath.parent_path(), ec);
+
+		renderDocApi->SetCaptureFilePathTemplate(capturePath.string().c_str());
+	}
+
+	spdlog::info("[RenderDoc] API acquired. Capture template: {}", renderDocApi->GetCaptureFilePathTemplate());
+	return true;
+}
+
+// Attach to a renderdoc.dll somebody else already loaded (i.e. the engine's -attach_renderdoc path).
+// Never calls LoadLibrary, so it cannot influence hook installation.
+bool AttachToLoadedRenderDoc()
+{
+	if (renderDocApi)
+		return true;
+
+	const auto renderDocModule = GetModuleHandleW(L"renderdoc.dll");
+
+	if (!renderDocModule)
+		return false;
+
+	if (!AcquireRenderDocApi(renderDocModule))
+		return false;
+
+	spdlog::info("[RenderDoc] Attached to an already-loaded renderdoc.dll");
+	return true;
+}
+
 void LoadRenderDoc()
 {
-	// bool s_loading = false;
-	//if (s_loading || renderDocApi)
-	//{
-	//	spdlog::debug("[RenderDoc] Already initialized, skipping");
-	//	return;
-	//}
-	//s_loading = true;
-
-	std::filesystem::path renderdocPath = L"C:\\Program Files\\RenderDoc\\renderdoc.dll";
-
-	if (!std::filesystem::exists(renderdocPath))
+	if (renderDocApi)
 	{
-		spdlog::debug("[RenderDoc] renderdoc.dll not found at: {}", renderdocPath.string());
+		spdlog::debug("[RenderDoc] Already initialized, skipping");
 		return;
 	}
 
-	HMODULE renderDocModule = LoadLibraryW(renderdocPath.wstring().c_str());
+	const std::filesystem::path renderdocPath = ModConfiguration.RenderDoc.DllPath;
+
+	if (!std::filesystem::exists(renderdocPath))
+	{
+		spdlog::warn("[RenderDoc] renderdoc.dll not found at: {}", renderdocPath.string());
+		return;
+	}
+
 	spdlog::debug("[RenderDoc] Attempting to load renderdoc.dll from {}", renderdocPath.string());
+	HMODULE renderDocModule = LoadLibraryW(renderdocPath.wstring().c_str());
 
 	if (!renderDocModule)
 	{
-		spdlog::debug("[RenderDoc] Failed to load renderdoc.dll");
+		spdlog::warn("[RenderDoc] Failed to load renderdoc.dll");
 		return;
 	}
 
 	spdlog::info("[RenderDoc] Loaded renderdoc.dll from {}", renderdocPath.string());
 
-	auto RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)GetProcAddress(renderDocModule, "RENDERDOC_GetAPI");
-	if (!RENDERDOC_GetAPI)
-	{
-		spdlog::info("[RenderDoc] Failed to get RENDERDOC_GetAPI");
+	if (!AcquireRenderDocApi(renderDocModule))
 		FreeLibrary(renderDocModule);
-		return;
-	}
-
-	int ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_7_0, (void **)&renderDocApi);
-	if (ret != 1 || !renderDocApi)
-	{
-		spdlog::info("[RenderDoc] Failed to get API interface");
-		FreeLibrary(renderDocModule);
-		renderDocApi = nullptr;
-		return;
-	}
-
-	std::filesystem::path captureDir = L"C:\\Users\\RG\\Desktop\\HZD_Render_Caps";
-	std::filesystem::create_directories(captureDir);
-	renderDocApi->SetCaptureFilePathTemplate((captureDir / "capture").string().c_str());
-	spdlog::info("[RenderDoc] Capture path set to {}", (captureDir / "capture").string());
 }
 
 
@@ -233,68 +283,22 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 		std::wstring test = L"Loading: " + filename;
 		OutputDebugStringW(test.c_str());
 
-				/*
-		static bool RDLoaded = false;
-		if (!RDLoaded)
+		// Loader-level view of module arrival, which catches static/delay-load paths that never touch
+		// kernel32!LoadLibrary and therefore never show up in the RenderDocDiag trace hooks.
+		for (const auto watched : { L"renderdoc.dll", L"d3d12.dll", L"D3D12Core.dll", L"dxgi.dll", L"sl.interposer.dll", L"nvapi64.dll" })
 		{
-			RDLoaded = true;
-			LoadRenderDoc();			
-		}
-
-		if (_wcsicmp(filename.c_str(), L"d3d12.dll") == 0)
-		{
-			spdlog::info("[RenderDoc] D3D12.dll loading", std::filesystem::path(filename).string());
-			OutputDebugStringW(L"Loading:  D3D12.dll");
-			// Hook D3D12CreateDevice once — separate guard here
-			static bool s_d3d12Hooked = false;
-			if (!s_d3d12Hooked && ModuleHandle && *ModuleHandle)
+			if (_wcsicmp(filename.c_str(), watched) == 0)
 			{
-				HMODULE hMod = static_cast<HMODULE>(*ModuleHandle);
-				auto addr = reinterpret_cast<uintptr_t>(GetProcAddress(hMod, "D3D12CreateDevice"));
-
-				if (addr)
-				{
-					OrigD3D12CreateDevice = reinterpret_cast<decltype(&D3D12CreateDevice)>(addr);
-					DetourTransactionBegin();
-					DetourUpdateThread(GetCurrentThread());
-					DetourAttach(reinterpret_cast<void **>(&OrigD3D12CreateDevice), &HookedD3D12CreateDevice);
-					DetourTransactionCommit();
-					s_d3d12Hooked = true;
-					spdlog::info("[RenderDoc] D3D12CreateDevice hooked in {}", std::filesystem::path(filename).string());
-				}
-				else
-				{
-					spdlog::warn("[RenderDoc] D3D12CreateDevice not exported from {}", std::filesystem::path(filename).string());
-				}
+				spdlog::info(
+					"[RDDiag] LdrLoadDll(\"{}\") status=0x{:08X} handle={:p}",
+					std::filesystem::path(filename).string(),
+					static_cast<uint32_t>(status),
+					ModuleHandle ? *ModuleHandle : nullptr);
+				break;
 			}
 		}
 
-
-		if (_wcsicmp(filename.c_str(), L"D3D12Core.dll") == 0)
-		{
-			spdlog::info("[RenderDoc] D3D12Core.dll loading");
-
-			if (ModuleHandle && *ModuleHandle)
-			{
-				HMODULE hMod = static_cast<HMODULE>(*ModuleHandle);
-
-				// Enumerate exports to find the real device creation function
-				auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hMod);
-				auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<uintptr_t>(hMod) + dos->e_lfanew);
-				auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-
-				if (dir.VirtualAddress)
-				{
-					auto exports = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uintptr_t>(hMod) + dir.VirtualAddress);
-					auto names = reinterpret_cast<uint32_t *>(reinterpret_cast<uintptr_t>(hMod) + exports->AddressOfNames);
-
-					spdlog::info("[RenderDoc] D3D12Core.dll exports:");
-					for (uint32_t i = 0; i < exports->NumberOfNames; i++)
-						spdlog::info("  {}", reinterpret_cast<const char *>(reinterpret_cast<uintptr_t>(hMod) + names[i]));
-				}
-			}
-		}
-		*/
+	
 		
 	}
 
@@ -304,15 +308,6 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 
 DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 {
-	/*
-	HMODULE hD3D12 = GetModuleHandleW(L"d3d12.dll");
-	HMODULE hD3D12Core = GetModuleHandleW(L"D3D12Core.dll");
-	OutputDebugStringW(
-		hD3D12 ? L"d3d12.dll ALREADY loaded in DECLARE_HOOK_TRANSACTION\n" : L"d3d12.dll not loaded yet in Offsets::DECLARE_HOOK_TRANSACTION\n");
-	OutputDebugStringW(
-		hD3D12Core ? L"D3D12Core.dll ALREADY loaded in Offsets::DECLARE_HOOK_TRANSACTION\n" : L"D3D12Core.dll not loaded yet in Offsets::DECLARE_HOOK_TRANSACTION\n");
-	*/
-
 	// Hook LdrLoadDll to catch anything that loads afterward
 	HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
 
@@ -320,9 +315,6 @@ DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 
 	return Hooks::WriteJump(addr, &HookedLdrLoadDll, reinterpret_cast<void **>(&OrigLdrLoadDll));
 };
-
-
-
 
 namespace Offsets
 {
@@ -335,9 +327,35 @@ namespace Offsets
 		static bool RDLoaded = false;
 		if (!RDLoaded)
 		{
-			spdlog::info("Loading RenderDoc");
 			RDLoaded = true;
-			LoadRenderDoc();
+
+			const bool engineAttach = EngineWillAttachRenderDoc();
+			const bool diagnostics = ModConfiguration.RenderDoc.Diagnostics;
+			const bool bypassStreamline = ModConfiguration.RenderDoc.BypassStreamline;
+
+			// Interceptors first so we sit underneath whatever RenderDoc installs
+			if (diagnostics || bypassStreamline)
+				RenderDocDiag::InstallTraceHooks(diagnostics, bypassStreamline);
+
+			if (diagnostics)
+				RenderDocDiag::Report("before RenderDoc load");
+
+			if (engineAttach)
+			{
+				spdlog::info("[RenderDoc] -attach_renderdoc detected. Deferring to the engine; the mod will not load renderdoc.dll.");
+			}
+			else if (!ModConfiguration.RenderDoc.Enable)
+			{
+				spdlog::debug("[RenderDoc] Disabled via [RenderDoc] Enable in mod_config.ini.");
+			}
+			else
+			{
+				spdlog::info("Loading RenderDoc");
+				LoadRenderDoc();
+			}
+
+			if (diagnostics)
+				RenderDocDiag::Report("after RenderDoc load");
 		}
 
 		auto dosHeader = reinterpret_cast<const PIMAGE_DOS_HEADER>(GetModuleHandleW(nullptr));

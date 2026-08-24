@@ -1,5 +1,6 @@
 #include "LogWindow.h"
 #include "test.h"
+#include "HRZR/RenderDocDiag.h"
 
 #include <Windows.h>
 
@@ -16,55 +17,6 @@ namespace HRZR::DebugUI
 		g_wantCapture.store(true);
 		spdlog::info("[RenderDoc] Capture queued for next NxDXGIImpl::Present");
 	}
-	/*
-	void TriggerCapture()
-	{
-		if (!renderDocApi)
-		{
-			spdlog::warn("[RenderDoc] Cannot trigger capture - RenderDoc API not available");
-			return;
-		}
-
-		// Check how many captures exist before triggering
-		uint32_t capturesBefore = renderDocApi->GetNumCaptures();
-		spdlog::info("[RenderDoc] Captures before trigger: {}", capturesBefore);
-
-		// Check if we're already mid-capture
-		spdlog::info("[RenderDoc] IsFrameCapturing: {}", renderDocApi->IsFrameCapturing());
-
-		renderDocApi->TriggerCapture();
-
-		spdlog::info("[RenderDoc] TriggerCapture() called");
-
-		// TriggerCapture queues for the NEXT Present() call — wait a couple frames
-		// then check if the count went up
-		std::thread([=]()
-		{
-			std::this_thread::sleep_for(std::chrono::seconds(3));
-
-			uint32_t capturesAfter = renderDocApi->GetNumCaptures();
-			spdlog::info("[RenderDoc] Captures after trigger: {}", capturesAfter);
-
-			if (capturesAfter > capturesBefore)
-			{
-				// Get the path RenderDoc actually wrote to
-				char path[512] = {};
-				uint64_t timestamp = 0;
-				uint32_t pathLen = sizeof(path);
-				renderDocApi->GetCapture(capturesAfter - 1, path, &pathLen, &timestamp);
-				spdlog::info("[RenderDoc] Capture written to: {}", path);
-			}
-			else
-			{
-				spdlog::warn(
-					"[RenderDoc] Capture count did not increase — "
-					"swap chain likely not hooked. "
-					"RenderDoc may have loaded after D3D device was created.");
-			}
-		}).detach();
-	}
-	*/
-
 	void LogWindow::Render()
 	{
 		if (!ImGui::Begin(GetId().c_str(), &m_WindowOpen))
@@ -80,6 +32,12 @@ namespace HRZR::DebugUI
 
 			if (ImGui::Button("Render Doc"))
 				TriggerCapture();
+
+			if (ImGui::Button("RenderDoc: diagnose"))
+			{
+				RenderDocDiag::Report("on demand");
+				RenderDocDiag::ProbeCreation();
+			}
 
 			ImGui::EndPopup();
 		}

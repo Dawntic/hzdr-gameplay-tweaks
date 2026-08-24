@@ -113,6 +113,7 @@ namespace InternalModConfig
 	{
 #define PARSE_TOML_MEMBER(obj, x) o.x = (*obj)[#x].value_or(decltype(o.x) {})
 #define PARSE_TOML_HOTKEY(obj, x) o.Hotkeys.x = (*obj)[#x].value_or(-1)
+#define PARSE_TOML_RENDERDOC(obj, x) o.RenderDoc.x = (*obj)[#x].value_or(decltype(o.RenderDoc.x) {})
 
 		// [General]
 		if (auto general = Table["General"].as_table())
@@ -151,6 +152,16 @@ namespace InternalModConfig
 			PARSE_TOML_MEMBER(gameplay, DisableFocusMagnetism);
 
 			PARSE_TOML_MEMBER(gameplay, ForceLeftAlignedCamera);
+		}
+
+		// [RenderDoc]
+		if (auto renderDoc = Table["RenderDoc"].as_table())
+		{
+			PARSE_TOML_RENDERDOC(renderDoc, Enable);
+			PARSE_TOML_RENDERDOC(renderDoc, Diagnostics);
+			PARSE_TOML_RENDERDOC(renderDoc, BypassStreamline);
+			PARSE_TOML_RENDERDOC(renderDoc, DllPath);
+			PARSE_TOML_RENDERDOC(renderDoc, CapturePath);
 		}
 
 		// [Hotkeys]
@@ -235,12 +246,16 @@ namespace InternalModConfig
 		parseCoreObjectCacheTable("CachedWeatherSetups", o.CachedWeatherSetups);
 		parseCoreObjectCacheTable("CachedInventoryItems", o.CachedInventoryItems);
 
+#undef PARSE_TOML_RENDERDOC
 #undef PARSE_TOML_HOTKEY
 #undef PARSE_TOML_MEMBER
 	}
 
 	void PostProcessSettings(GlobalSettings& s)
 	{
+		if (s.RenderDoc.DllPath.empty())
+			s.RenderDoc.DllPath = "C:\\Program Files\\RenderDoc\\renderdoc.dll";
+
 		// clang-format off
 		if (!s.EnableAssetOverrides)
 			s.AssetOverrides.clear();
