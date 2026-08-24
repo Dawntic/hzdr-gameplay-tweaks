@@ -61,6 +61,7 @@ namespace InternalModConfig
 			bool NameCommandLists;
 			bool LogCommandListNames;
 			bool EmitPassMarkers;
+			bool WrapUnnamedLists;
 			std::string DllPath;
 			std::string CapturePath;
 		} RenderDoc;

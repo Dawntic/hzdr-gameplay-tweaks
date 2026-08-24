@@ -52,7 +52,7 @@ namespace HRZR::RenderPassNames
 	//
 	// The engine hands us the whole descriptor:
 	//   "frame : 11445 RenderOrder: 0x00001002 target: gfx queue:0 vp:0 order:ORDER_X suborder:0 sync:2"
-	// and we reduce it to a readable title: "Order X 0".
+	// and we reduce it to a readable title: "X 0".
 	//
 
 	// Tokens that read badly when plainly title cased. Extend freely, it is just a lookup.
@@ -123,6 +123,7 @@ namespace HRZR::RenderPassNames
 	static std::string BuildLabel(std::string_view Order, std::string_view Suborder)
 	{
 		std::string label;
+		bool first = true;
 
 		for (size_t i = 0; i <= Order.size();)
 		{
@@ -131,10 +132,20 @@ namespace HRZR::RenderPassNames
 
 			if (count > 0)
 			{
-				if (!label.empty())
-					label += ' ';
+				const auto token = Order.substr(i, count);
 
-				label += TitleCase(Order.substr(i, count));
+				// Every value is either ORDER_ prefixed or not; the prefix carries no information. Only
+				// strip it at the front - DEFERRED_ENQUEUE_ORDER_FWD_... uses it as a real word.
+				const bool skip = first && token == "ORDER";
+				first = false;
+
+				if (!skip)
+				{
+					if (!label.empty())
+						label += ' ';
+
+					label += TitleCase(token);
+				}
 			}
 
 			if (next == std::string_view::npos)
@@ -161,13 +172,24 @@ namespace HRZR::RenderPassNames
 	// list closes, which nests everything recorded in between underneath the pass name.
 	//
 	using CloseFn = HRESULT(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *);
+	using ResetFn = HRESULT(STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, ID3D12CommandAllocator *, ID3D12PipelineState *);
 
-	// Close sits at byte offset 0x48 in ID3D12GraphicsCommandList's vtable
+	// Byte offsets 0x48 and 0x50 in ID3D12GraphicsCommandList's vtable
 	static constexpr uint32_t CloseSlot = 9;
+	static constexpr uint32_t ResetSlot = 10;
+
+	struct VtableEntry
+	{
+		CloseFn Close;
+		ResetFn Reset;
+	};
 
 	static std::mutex g_ScopeMutex;
-	static std::unordered_map<void **, CloseFn> g_PatchedVtables;
+	static std::unordered_map<void **, VtableEntry> g_PatchedVtables;
 	static std::unordered_set<ID3D12GraphicsCommandList *> g_OpenScopes;
+
+	// Creation time names ("CommandList_Copy") for lists that never receive an order descriptor
+	static std::unordered_map<ID3D12GraphicsCommandList *, std::string> g_FallbackNames;
 
 	static HRESULT STDMETHODCALLTYPE HookedClose(ID3D12GraphicsCommandList *This)
 	{
@@ -178,7 +200,7 @@ namespace HRZR::RenderPassNames
 			std::lock_guard lock(g_ScopeMutex);
 
 			if (const auto entry = g_PatchedVtables.find(*reinterpret_cast<void ***>(This)); entry != g_PatchedVtables.end())
-				original = entry->second;
+				original = entry->second.Close;
 
 			closeScope = g_OpenScopes.erase(This) > 0;
 		}
@@ -190,17 +212,71 @@ namespace HRZR::RenderPassNames
 		return original(This);
 	}
 
-	static void OpenPassScope(void *Object, const String *Name)
+	// Copy and compute lists carry real GPU work but never get an order descriptor, so without this their
+	// CopyBufferRegion/CopyTextureRegion calls sit bare between the named sections. Direct lists are left
+	// alone - they get a proper name moments later, and opening a scope here would leave an empty node in
+	// front of every one of them.
+	static HRESULT STDMETHODCALLTYPE HookedReset(
+		ID3D12GraphicsCommandList *This,
+		ID3D12CommandAllocator *Allocator,
+		ID3D12PipelineState *InitialState)
 	{
-		const std::string_view text(Name->data(), Name->size());
+		ResetFn original = nullptr;
 
-		// Command lists are also named at creation time ("CommandList_Direct"), where the list is still
-		// closed and no recording call is legal. Only the open-time descriptor carries an order field.
-		const auto order = ExtractField(text, " order:");
+		{
+			std::lock_guard lock(g_ScopeMutex);
 
-		if (order.empty())
+			if (const auto entry = g_PatchedVtables.find(*reinterpret_cast<void ***>(This)); entry != g_PatchedVtables.end())
+				original = entry->second.Reset;
+
+			// A list must be closed to be reset, so any scope still tracked here was never ended. Drop it
+			// rather than emitting EndEvent on a closed list.
+			g_OpenScopes.erase(This);
+		}
+
+		const auto result = original(This, Allocator, InitialState);
+
+		if (FAILED(result) || !ModConfiguration.RenderDoc.WrapUnnamedLists || This->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT)
+			return result;
+
+		std::string label;
+
+		{
+			std::lock_guard lock(g_ScopeMutex);
+
+			if (const auto name = g_FallbackNames.find(This); name != g_FallbackNames.end())
+			{
+				label = name->second;
+				g_OpenScopes.insert(This);
+			}
+		}
+
+		// Recording state only begins once Reset has returned
+		if (!label.empty())
+			This->BeginEvent(1, label.c_str(), static_cast<UINT>(label.size() + 1));
+
+		return result;
+	}
+
+	// Caller must hold g_ScopeMutex
+	static void EnsureVtablePatched(ID3D12GraphicsCommandList *CommandList)
+	{
+		auto vtable = *reinterpret_cast<void ***>(CommandList);
+
+		if (g_PatchedVtables.contains(vtable))
 			return;
 
+		// Register the originals before patching, so a concurrent call on a sibling list always resolves
+		g_PatchedVtables.emplace(
+			vtable,
+			VtableEntry { reinterpret_cast<CloseFn>(vtable[CloseSlot]), reinterpret_cast<ResetFn>(vtable[ResetSlot]) });
+
+		Hooks::WriteVirtualFunction(reinterpret_cast<uintptr_t>(vtable), CloseSlot, &HookedClose);
+		Hooks::WriteVirtualFunction(reinterpret_cast<uintptr_t>(vtable), ResetSlot, &HookedReset);
+	}
+
+	static void OnCommandListNamed(void *Object, const String *Name)
+	{
 		// The same helper names fences, queues and allocators too
 		ID3D12GraphicsCommandList *probe = nullptr;
 
@@ -210,21 +286,29 @@ namespace HRZR::RenderPassNames
 		probe->Release();
 
 		// The engine calls SetDescriptorHeaps on this exact pointer a few instructions later, so it is both
-		// a graphics command list and already recording.
+		// a graphics command list and, on the order-naming path, already recording.
 		const auto commandList = static_cast<ID3D12GraphicsCommandList *>(Object);
-		const auto label = BuildLabel(order, ExtractField(text, " suborder:"));
+		const std::string_view text(Name->data(), Name->size());
+		const auto order = ExtractField(text, " order:");
 
+		// Command lists are also named at creation ("CommandList_Copy"), where the list is still closed and
+		// no recording call is legal. Keep the name for the Reset fallback instead.
+		if (order.empty())
+		{
+			std::lock_guard lock(g_ScopeMutex);
+
+			EnsureVtablePatched(commandList);
+			g_FallbackNames[commandList] = std::string(text);
+			return;
+		}
+
+		const auto label = BuildLabel(order, ExtractField(text, " suborder:"));
 		bool closeStaleScope = false;
 
 		{
 			std::lock_guard lock(g_ScopeMutex);
 
-			// Register the original before patching, so a concurrent Close on a sibling list always resolves
-			if (auto vtable = *reinterpret_cast<void ***>(commandList); !g_PatchedVtables.contains(vtable))
-			{
-				g_PatchedVtables.emplace(vtable, reinterpret_cast<CloseFn>(vtable[CloseSlot]));
-				Hooks::WriteVirtualFunction(reinterpret_cast<uintptr_t>(vtable), CloseSlot, &HookedClose);
-			}
+			EnsureVtablePatched(commandList);
 
 			// Renamed without closing: end the previous scope so the pairing stays balanced
 			closeStaleScope = g_OpenScopes.contains(commandList);
@@ -251,7 +335,7 @@ namespace HRZR::RenderPassNames
 		OriginalNameD3DObject(Object, Name);
 
 		if (usable && ModConfiguration.RenderDoc.EmitPassMarkers)
-			OpenPassScope(Object, Name);
+			OnCommandListNamed(Object, Name);
 	}
 
 	DECLARE_HOOK_TRANSACTION(RenderPassNames)

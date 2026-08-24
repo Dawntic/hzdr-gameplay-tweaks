@@ -166,6 +166,7 @@ namespace InternalModConfig
 			PARSE_TOML_RENDERDOC(renderDoc, NameCommandLists);
 			PARSE_TOML_RENDERDOC(renderDoc, LogCommandListNames);
 			PARSE_TOML_RENDERDOC(renderDoc, EmitPassMarkers);
+			PARSE_TOML_RENDERDOC(renderDoc, WrapUnnamedLists);
 			PARSE_TOML_RENDERDOC(renderDoc, DllPath);
 			PARSE_TOML_RENDERDOC(renderDoc, CapturePath);
 		}
