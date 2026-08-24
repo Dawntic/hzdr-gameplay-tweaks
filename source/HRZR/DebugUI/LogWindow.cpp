@@ -1,6 +1,7 @@
 #include "LogWindow.h"
 #include "test.h"
 #include "HRZR/RenderDocDiag.h"
+#include "HRZR/RenderPassNames.h"
 
 #include <Windows.h>
 
@@ -37,6 +38,14 @@ namespace HRZR::DebugUI
 			{
 				RenderDocDiag::Report("on demand");
 				RenderDocDiag::ProbeCreation();
+			}
+
+			if (RenderPassNames::IsAvailable())
+			{
+				bool named = RenderPassNames::IsEnabled();
+
+				if (ImGui::Checkbox("Name D3D12 command lists", &named))
+					RenderPassNames::SetEnabled(named);
 			}
 
 			ImGui::EndPopup();

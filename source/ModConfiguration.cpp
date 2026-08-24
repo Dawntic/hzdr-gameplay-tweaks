@@ -40,7 +40,7 @@ namespace InternalModConfig
 			auto debugUISink = std::make_shared<HRZR::DebugUI::LogWindow::LogSink>();
 			sinks.emplace_back(std::move(debugUISink));
 
-			if constexpr (false)
+			if (GetModifiableSettings().LogToFile)
 			{
 				auto logFileSink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(GetModRelativePath("mod_log.txt").string(), true);
 				sinks.emplace_back(std::move(logFileSink));
@@ -122,6 +122,7 @@ namespace InternalModConfig
 			PARSE_TOML_MEMBER(general, EnableAssetLogging);
 			PARSE_TOML_MEMBER(general, EnableAssetOverrides);
 			PARSE_TOML_MEMBER(general, DebugMenuFontScale);
+			PARSE_TOML_MEMBER(general, LogToFile);
 
 			PARSE_TOML_MEMBER(general, SkipIntroLogo);
 			PARSE_TOML_MEMBER(general, SkipPSNAccountLinking);
@@ -160,6 +161,10 @@ namespace InternalModConfig
 			PARSE_TOML_RENDERDOC(renderDoc, Enable);
 			PARSE_TOML_RENDERDOC(renderDoc, Diagnostics);
 			PARSE_TOML_RENDERDOC(renderDoc, BypassStreamline);
+			PARSE_TOML_RENDERDOC(renderDoc, RedirectEngineLoad);
+			PARSE_TOML_RENDERDOC(renderDoc, TranslateAgsMarkers);
+			PARSE_TOML_RENDERDOC(renderDoc, NameCommandLists);
+			PARSE_TOML_RENDERDOC(renderDoc, LogCommandListNames);
 			PARSE_TOML_RENDERDOC(renderDoc, DllPath);
 			PARSE_TOML_RENDERDOC(renderDoc, CapturePath);
 		}

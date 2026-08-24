@@ -7,6 +7,7 @@
 
 #include "../../test.h"
 #include "../RenderDocDiag.h"
+#include "../RenderPassNames.h"
 #include <Windows.h>
 
 namespace HRZR
@@ -68,6 +69,11 @@ namespace HRZR
 		{
 			if (!renderDocApi)
 				AttachToLoadedRenderDoc();
+
+			// Must happen here, not at mod init: the executable's CRT initializers zero this flag and they
+			// run after our DllMain.
+			if (ModConfiguration.RenderDoc.NameCommandLists)
+				RenderPassNames::SetEnabled(true);
 
 			if (ModConfiguration.RenderDoc.Diagnostics)
 			{

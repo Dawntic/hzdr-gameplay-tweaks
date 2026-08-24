@@ -270,36 +270,153 @@ static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LE
 using LdrLoadDll_t = NTSTATUS(NTAPI *)(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle);
 
 static LdrLoadDll_t OrigLdrLoadDll = nullptr;
+
+// Resolved once during Hooks::Initialize rather than inside the hook, so the hook body stays cheap.
+static bool g_EngineAttachRequested = false;
+
+// std::filesystem::path::string() runs a locale conversion that throws on unconvertible input. That is
+// unusable here: this code runs inside the loader lock and returns into ntdll, where an escaping exception
+// terminates the process silently. Convert by hand instead.
+static std::wstring WidenLossy(const std::string& Value)
+{
+	if (Value.empty())
+		return {};
+
+	const int required = MultiByteToWideChar(CP_UTF8, 0, Value.data(), static_cast<int>(Value.size()), nullptr, 0);
+
+	if (required <= 0)
+		return {};
+
+	std::wstring result(static_cast<size_t>(required), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, Value.data(), static_cast<int>(Value.size()), result.data(), required);
+
+	return result;
+}
+
+static std::string NarrowLossy(const wchar_t *Value, size_t Length)
+{
+	if (!Value || Length == 0)
+		return {};
+
+	const int required = WideCharToMultiByte(CP_UTF8, 0, Value, static_cast<int>(Length), nullptr, 0, nullptr, nullptr);
+
+	if (required <= 0)
+		return {};
+
+	std::string result(static_cast<size_t>(required), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, Value, static_cast<int>(Length), result.data(), required, nullptr, nullptr);
+
+	return result;
+}
+
+// Bounded, so a bogus pointer cannot run off into unmapped memory before the guard below catches it.
+static std::string NarrowLossyBounded(const wchar_t *Value, size_t MaxChars)
+{
+	if (!Value)
+		return {};
+
+	size_t length = 0;
+
+	while (length < MaxChars && Value[length] != L'\0')
+		length++;
+
+	return NarrowLossy(Value, length);
+}
+
+// Everything the hook wants to do beyond calling the original, split out so the hook itself can wrap it in
+// a __try. Returns the (possibly redirected) status.
+static NTSTATUS LdrLoadDllTail(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle, NTSTATUS Status)
+{
+	if (!Name || !Name->Buffer || Name->Length == 0)
+		return Status;
+
+	try
+	{
+		const std::wstring fullName(Name->Buffer, Name->Length / sizeof(wchar_t));
+		const auto pos = fullName.rfind(L'\\');
+		const std::wstring filename = (pos != std::wstring::npos) ? fullName.substr(pos + 1) : fullName;
+
+		const bool isRenderDoc = _wcsicmp(filename.c_str(), L"renderdoc.dll") == 0;
+
+		// The engine's -attach_renderdoc handler asks the loader for renderdoc.dll and gives up quietly if
+		// it isn't where it expects. Rather than guessing that path, satisfy the request with the
+		// configured absolute path, keeping the load on the engine's own call.
+		static bool s_redirectedEngineLoad = false;
+
+		if (Status == STATUS_DLL_NOT_FOUND && isRenderDoc && !s_redirectedEngineLoad && g_EngineAttachRequested &&
+			ModConfiguration.RenderDoc.RedirectEngineLoad)
+		{
+			s_redirectedEngineLoad = true;
+
+			std::wstring absolutePath = WidenLossy(ModConfiguration.RenderDoc.DllPath);
+
+			UNICODE_STRING redirected {};
+			redirected.Buffer = absolutePath.data();
+			redirected.Length = static_cast<USHORT>(absolutePath.size() * sizeof(wchar_t));
+			redirected.MaximumLength = static_cast<USHORT>(redirected.Length + sizeof(wchar_t));
+
+			Status = OrigLdrLoadDll(nullptr, LoadFlags, &redirected, ModuleHandle);
+
+			spdlog::info(
+				"[RenderDoc] Engine asked for \"{}\" and missed. Redirected to \"{}\": status=0x{:08X} handle={:p}",
+				NarrowLossy(fullName.data(), fullName.size()),
+				ModConfiguration.RenderDoc.DllPath,
+				static_cast<uint32_t>(Status),
+				ModuleHandle ? *ModuleHandle : nullptr);
+		}
+
+		// Loader-level view of module arrival, which catches static/delay-load paths that never touch
+		// kernel32!LoadLibrary and therefore never show up in the RenderDocDiag trace hooks. Kept to a
+		// short fixed list: this fires for every DLL the process ever loads.
+		if (ModConfiguration.RenderDoc.Diagnostics)
+		{
+			bool interesting = isRenderDoc;
+
+			for (const auto watched : { L"d3d12.dll", L"D3D12Core.dll", L"dxgi.dll", L"sl.interposer.dll", L"nvapi64.dll" })
+			{
+				if (_wcsicmp(filename.c_str(), watched) == 0)
+				{
+					interesting = true;
+					break;
+				}
+			}
+
+			// Log the name as requested, not the basename: whether the caller asked for a bare name or a full
+			// path decides where the file actually has to live.
+			if (interesting)
+			{
+				spdlog::info(
+					"[RDDiag] LdrLoadDll(\"{}\") searchPath=\"{}\" flags=0x{:08X} status=0x{:08X} handle={:p}",
+					NarrowLossy(fullName.data(), fullName.size()),
+					NarrowLossyBounded(SearchPath, 2048),
+					LoadFlags ? *LoadFlags : 0,
+					static_cast<uint32_t>(Status),
+					ModuleHandle ? *ModuleHandle : nullptr);
+			}
+		}
+	}
+	catch (...)
+	{
+		// A failed diagnostic must never take the loader down.
+	}
+
+	return Status;
+}
+
 static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRING Name, PHANDLE ModuleHandle)
 {
 	NTSTATUS status = OrigLdrLoadDll(SearchPath, LoadFlags, Name, ModuleHandle);
 
-	if (Name && Name->Buffer && Name->Length > 0)
+	// This returns into ntdll's loader. An access violation here is an SEH exception, which /EHsc does NOT
+	// route to catch(...) - it would unwind straight through the loader and kill the process with no
+	// diagnostics whatsoever. SearchPath in particular is not always a valid string pointer: ntdll passes
+	// sentinel values on some internal paths. Hence the hard guard.
+	__try
 	{
-		std::wstring fullName(Name->Buffer, Name->Length / sizeof(wchar_t));
-		auto pos = fullName.rfind(L'\\');
-		std::wstring filename = (pos != std::wstring::npos) ? fullName.substr(pos + 1) : fullName;
-
-		std::wstring test = L"Loading: " + filename;
-		OutputDebugStringW(test.c_str());
-
-		// Loader-level view of module arrival, which catches static/delay-load paths that never touch
-		// kernel32!LoadLibrary and therefore never show up in the RenderDocDiag trace hooks.
-		for (const auto watched : { L"renderdoc.dll", L"d3d12.dll", L"D3D12Core.dll", L"dxgi.dll", L"sl.interposer.dll", L"nvapi64.dll" })
-		{
-			if (_wcsicmp(filename.c_str(), watched) == 0)
-			{
-				spdlog::info(
-					"[RDDiag] LdrLoadDll(\"{}\") status=0x{:08X} handle={:p}",
-					std::filesystem::path(filename).string(),
-					static_cast<uint32_t>(status),
-					ModuleHandle ? *ModuleHandle : nullptr);
-				break;
-			}
-		}
-
-	
-		
+		status = LdrLoadDllTail(SearchPath, LoadFlags, Name, ModuleHandle, status);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
 	}
 
 	return status;
@@ -308,6 +425,9 @@ static NTSTATUS NTAPI HookedLdrLoadDll(PWSTR SearchPath, PULONG LoadFlags, PUNIC
 
 DECLARE_HOOK_TRANSACTION(LdrLoadDll)
 {
+	// Cached here so the hook body never has to parse the command line under the loader lock
+	g_EngineAttachRequested = EngineWillAttachRenderDoc();
+
 	// Hook LdrLoadDll to catch anything that loads afterward
 	HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
 
@@ -337,21 +457,36 @@ namespace Offsets
 			if (diagnostics || bypassStreamline)
 				RenderDocDiag::InstallTraceHooks(diagnostics, bypassStreamline);
 
+			// AGS is the only marker API this executable references, so it is the only place engine frame
+			// annotations could come from.
+			if (diagnostics || ModConfiguration.RenderDoc.TranslateAgsMarkers)
+				RenderDocDiag::InstallAgsMarkerBridge(diagnostics, ModConfiguration.RenderDoc.TranslateAgsMarkers);
+
 			if (diagnostics)
 				RenderDocDiag::Report("before RenderDoc load");
 
-			if (engineAttach)
+			if (ModConfiguration.RenderDoc.Enable)
 			{
-				spdlog::info("[RenderDoc] -attach_renderdoc detected. Deferring to the engine; the mod will not load renderdoc.dll.");
+				// Loading early is what makes RenderDoc's hooks land before the device is created. The
+				// engine's own -attach_renderdoc load happens much later (after D3D12Core.dll is up), so
+				// deferring to it would hook nothing. A bare-name load of an already-loaded module resolves
+				// against the loader's module list without touching disk, so the engine's attach still
+				// succeeds and binds to this exact instance.
+				if (engineAttach)
+					spdlog::info("[RenderDoc] -attach_renderdoc present; loading early anyway so the engine's attach binds to our instance.");
+
+				spdlog::info("Loading RenderDoc");
+				LoadRenderDoc();
 			}
-			else if (!ModConfiguration.RenderDoc.Enable)
+			else if (engineAttach)
 			{
-				spdlog::debug("[RenderDoc] Disabled via [RenderDoc] Enable in mod_config.ini.");
+				spdlog::warn(
+					"[RenderDoc] -attach_renderdoc detected but [RenderDoc] Enable is false. The engine attaches after device "
+					"creation, so hooks will likely miss. Set Enable = true.");
 			}
 			else
 			{
-				spdlog::info("Loading RenderDoc");
-				LoadRenderDoc();
+				spdlog::debug("[RenderDoc] Disabled via [RenderDoc] Enable in mod_config.ini.");
 			}
 
 			if (diagnostics)

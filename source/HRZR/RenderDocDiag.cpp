@@ -32,6 +32,9 @@ namespace RenderDocDiag
 		"DXGIGetDebugInterface1",
 		"DXGIDeclareAdapterRemovalSupport",
 		"agsDriverExtensionsDX12_CreateDevice",
+		"agsDriverExtensionsDX12_PushMarker",
+		"agsDriverExtensionsDX12_PopMarker",
+		"agsDriverExtensionsDX12_SetMarker",
 		"agsInitialize",
 		"RENDERDOC_GetAPI",
 		"nvapi_QueryInterface",
@@ -628,6 +631,9 @@ namespace RenderDocDiag
 			{ L"sl.interposer.dll", "D3D12CreateDevice" },
 			{ L"sl.interposer.dll", "CreateDXGIFactory2" },
 			{ L"amd_ags_x64.dll", "agsDriverExtensionsDX12_CreateDevice" },
+			{ L"amd_ags_x64.dll", "agsDriverExtensionsDX12_PushMarker" },
+			{ L"amd_ags_x64.dll", "agsDriverExtensionsDX12_PopMarker" },
+			{ L"amd_ags_x64.dll", "agsDriverExtensionsDX12_SetMarker" },
 		};
 
 		for (const auto& target : targets)
@@ -842,5 +848,151 @@ namespace RenderDocDiag
 
 		ScanObjectFields("NxD3DImpl", NxD3DImplPtr, 256);
 		ScanObjectFields("NxDXGIImpl", NxDXGIImplPtr, 256);
+	}
+
+	//
+	// AGS marker bridge
+	//
+	// AGS is the only marker API this executable references, so if the engine emits anything it comes
+	// through here. We sit under RenderDoc's IAT patch, so we observe the calls the game actually makes.
+	// Forwarding re-emits them as PIX ANSI events (metadata 1), which RenderDoc decodes into the event
+	// browser tree.
+	//
+	// Params left opaque on purpose: the AGS struct layouts move between SDK versions and we only need to
+	// know whether the engine calls these and what they answer, not what is inside them.
+	using AgsInitialize_t = int(__cdecl *)(int, const void *, void **, void *);
+	using AgsDX12CreateDevice_t = int(__cdecl *)(void *, const void *, const void *, void *);
+
+	using AgsPushMarker_t = int(__cdecl *)(void *, ID3D12GraphicsCommandList *, const char *);
+	using AgsPopMarker_t = int(__cdecl *)(void *, ID3D12GraphicsCommandList *);
+	using AgsSetMarker_t = int(__cdecl *)(void *, ID3D12GraphicsCommandList *, const char *);
+
+	static AgsInitialize_t OrigAgsInitialize = nullptr;
+	static AgsDX12CreateDevice_t OrigAgsDX12CreateDevice = nullptr;
+	static AgsPushMarker_t OrigAgsPushMarker = nullptr;
+	static AgsPopMarker_t OrigAgsPopMarker = nullptr;
+	static AgsSetMarker_t OrigAgsSetMarker = nullptr;
+
+	static bool s_AgsTrace = false;
+	static bool s_AgsForward = false;
+	static std::atomic_uint32_t s_AgsCallCount = 0;
+
+	// Enough to prove whether the engine emits markers at all without drowning the log every frame
+	static constexpr uint32_t AgsTraceLimit = 64;
+
+	static void TraceAgsCall(const char *Which, const char *Data)
+	{
+		const auto count = s_AgsCallCount.fetch_add(1);
+
+		if (!s_AgsTrace || count >= AgsTraceLimit)
+			return;
+
+		TraceGuard guard;
+
+		if (guard.Entered)
+			spdlog::info("[RDDiag] AGS marker #{}: {}(\"{}\")", count, Which, Data ? Data : "");
+	}
+
+	static int __cdecl HookedAgsInitialize(int Version, const void *Config, void **Context, void *GpuInfo)
+	{
+		const auto result = OrigAgsInitialize(Version, Config, Context, GpuInfo);
+
+		TraceGuard guard;
+
+		if (guard.Entered)
+			spdlog::info("[RDDiag] agsInitialize(version={}) -> {} (0 == AGS_SUCCESS)", Version, result);
+
+		return result;
+	}
+
+	static int __cdecl HookedAgsDX12CreateDevice(void *Context, const void *CreationParams, const void *ExtensionParams, void *Returned)
+	{
+		const auto result = OrigAgsDX12CreateDevice(Context, CreationParams, ExtensionParams, Returned);
+
+		TraceGuard guard;
+
+		if (guard.Entered)
+			spdlog::info("[RDDiag] agsDriverExtensionsDX12_CreateDevice() -> {} (0 == AGS_SUCCESS)", result);
+
+		return result;
+	}
+
+	static int __cdecl HookedAgsPushMarker(void *Context, ID3D12GraphicsCommandList *CommandList, const char *Data)
+	{
+		TraceAgsCall("PushMarker", Data);
+
+		if (s_AgsForward && CommandList && Data)
+			CommandList->BeginEvent(1, Data, static_cast<UINT>(strlen(Data) + 1));
+
+		return OrigAgsPushMarker(Context, CommandList, Data);
+	}
+
+	static int __cdecl HookedAgsPopMarker(void *Context, ID3D12GraphicsCommandList *CommandList)
+	{
+		TraceAgsCall("PopMarker", nullptr);
+
+		if (s_AgsForward && CommandList)
+			CommandList->EndEvent();
+
+		return OrigAgsPopMarker(Context, CommandList);
+	}
+
+	static int __cdecl HookedAgsSetMarker(void *Context, ID3D12GraphicsCommandList *CommandList, const char *Data)
+	{
+		TraceAgsCall("SetMarker", Data);
+
+		if (s_AgsForward && CommandList && Data)
+			CommandList->SetMarker(1, Data, static_cast<UINT>(strlen(Data) + 1));
+
+		return OrigAgsSetMarker(Context, CommandList, Data);
+	}
+
+	void InstallAgsMarkerBridge(bool Trace, bool Forward)
+	{
+		s_AgsTrace = Trace;
+		s_AgsForward = Forward;
+
+		static bool installed = false;
+
+		if (installed)
+			return;
+
+		const auto ags = GetModuleHandleW(L"amd_ags_x64.dll");
+
+		if (!ags)
+		{
+			spdlog::warn("[RDDiag] amd_ags_x64.dll not loaded, cannot bridge AGS markers");
+			return;
+		}
+
+		// Resolved raw so we hook the real implementation rather than whatever sits in front of it
+		OrigAgsInitialize = reinterpret_cast<AgsInitialize_t>(RawExportLookup(ags, "agsInitialize"));
+		OrigAgsDX12CreateDevice = reinterpret_cast<AgsDX12CreateDevice_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_CreateDevice"));
+		OrigAgsPushMarker = reinterpret_cast<AgsPushMarker_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_PushMarker"));
+		OrigAgsPopMarker = reinterpret_cast<AgsPopMarker_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_PopMarker"));
+		OrigAgsSetMarker = reinterpret_cast<AgsSetMarker_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_SetMarker"));
+
+		if (!OrigAgsInitialize || !OrigAgsDX12CreateDevice || !OrigAgsPushMarker || !OrigAgsPopMarker || !OrigAgsSetMarker)
+		{
+			spdlog::warn("[RDDiag] AGS marker exports missing");
+			return;
+		}
+
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		DetourAttach(reinterpret_cast<void **>(&OrigAgsInitialize), &HookedAgsInitialize);
+		DetourAttach(reinterpret_cast<void **>(&OrigAgsDX12CreateDevice), &HookedAgsDX12CreateDevice);
+		DetourAttach(reinterpret_cast<void **>(&OrigAgsPushMarker), &HookedAgsPushMarker);
+		DetourAttach(reinterpret_cast<void **>(&OrigAgsPopMarker), &HookedAgsPopMarker);
+		DetourAttach(reinterpret_cast<void **>(&OrigAgsSetMarker), &HookedAgsSetMarker);
+
+		if (DetourTransactionCommit() != NO_ERROR)
+		{
+			spdlog::error("[RDDiag] Failed to commit AGS marker transaction");
+			return;
+		}
+
+		installed = true;
+		spdlog::info("[RDDiag] AGS marker bridge installed (trace={}, forward={})", Trace, Forward);
 	}
 }

@@ -34,6 +34,11 @@ namespace RenderDocDiag
 	// Report the owning module of the vtables of the live objects the game is actually rendering with.
 	void ReportLiveObjects(void *NxD3DImplPtr, void *NxDXGIImplPtr);
 
+	// The engine routes its GPU debug markers through AMD AGS, which only does anything on an AMD device
+	// created via agsDriverExtensionsDX12_CreateDevice. Trace those calls, and optionally re-emit them as
+	// PIX events on the command list so RenderDoc shows them as frame annotations.
+	void InstallAgsMarkerBridge(bool Trace, bool Forward);
+
 	// Name of the module an address lives in, or "<none/trampoline>" if it isn't inside a loaded image.
 	std::string OwnerOf(const void *Address);
 }

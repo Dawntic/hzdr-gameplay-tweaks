@@ -24,6 +24,7 @@ namespace InternalModConfig
 		bool EnableAssetLogging;
 		bool EnableAssetOverrides;
 		float DebugMenuFontScale;
+		bool LogToFile;
 
 		bool SkipIntroLogo;
 		bool SkipPSNAccountLinking;
@@ -55,6 +56,10 @@ namespace InternalModConfig
 			bool Enable;
 			bool Diagnostics;
 			bool BypassStreamline;
+			bool RedirectEngineLoad;
+			bool TranslateAgsMarkers;
+			bool NameCommandLists;
+			bool LogCommandListNames;
 			std::string DllPath;
 			std::string CapturePath;
 		} RenderDoc;
