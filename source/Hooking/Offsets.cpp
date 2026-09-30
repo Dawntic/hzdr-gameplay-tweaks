@@ -121,6 +121,7 @@ namespace Offsets::detail
 #include "test.h"
 #include "ModConfiguration.h"
 #include "HRZR/RenderDocDiag.h"
+#include "HRZR/RenderPassNames.h"
 RENDERDOC_API_1_7_0 *renderDocApi = nullptr;
 std::atomic_bool g_wantCapture = false;
 
@@ -337,6 +338,14 @@ static NTSTATUS LdrLoadDllTail(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRI
 		const std::wstring filename = (pos != std::wstring::npos) ? fullName.substr(pos + 1) : fullName;
 
 		const bool isRenderDoc = _wcsicmp(filename.c_str(), L"renderdoc.dll") == 0;
+
+		// Earliest safe point to turn on the engine's debug naming. The executable's CRT initializers zero
+		// the gate flag, and they have run by the time anything loads d3d12.dll. Waiting until the first
+		// Present is too late for anything named during renderer init - pooled render targets and buffers
+		// are constructed once, well before the first frame, and are never renamed.
+		if (NT_SUCCESS(Status) && ModConfiguration.RenderDoc.NameCommandLists &&
+			_wcsicmp(filename.c_str(), L"d3d12.dll") == 0)
+			HRZR::RenderPassNames::SetEnabled(true);
 
 		// The engine's -attach_renderdoc handler asks the loader for renderdoc.dll and gives up quietly if
 		// it isn't where it expects. Rather than guessing that path, satisfy the request with the
