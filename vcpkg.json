@@ -3,18 +3,13 @@
   "supports": "windows",
   "dependencies": [
     "detours",
-    {
-      "name": "imgui",
-      "features": ["win32-binding", "dx12-binding"]
-    },
     "pkgconf",
     "quickdllproxy",
     {
       "name": "spdlog",
       "features": ["wchar"]
     },
-    "tomlplusplus",
-    "xbyak"
+    "tomlplusplus"
   ],
   "builtin-baseline": "a39a74405f277773aba08018bb797cb4a6614d0c"
 }

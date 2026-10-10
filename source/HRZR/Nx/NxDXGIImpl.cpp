@@ -1,7 +1,4 @@
 #include "../../ModConfiguration.h"
-#include "../../ModCoreEvents.h"
-#include "../Core/IStreamingManager.h"
-#include "../DebugUI/DebugUI.h"
 #include "NxD3DImpl.h"
 #include "NxDXGIImpl.h"
 
@@ -44,24 +41,6 @@ namespace HRZR
 
 	bool HookedPresent(NxDXGIImpl *Thisptr, void *a2)
 	{
-
-		const static bool initialized = []()
-		{
-			if (StreamingManager::GetInstance())
-				StreamingManager::GetInstance()->m_CoreFileManager->RegisterEventHandler(&ModCoreEvents::GetInstance());
-
-			return true;
-		}();
-
-		const static bool uiInitialized = [&]()
-		{
-			if (!ModConfiguration.EnableDebugMenu)
-				return false;
-
-			DebugUI::Initialize(Thisptr);
-			return true;
-		}();
-
 		// The first present is the earliest point where the device, queue and swapchain all exist, so it's
 		// the most informative snapshot of who hooked what. It's also the first point at which the engine's
 		// own -attach_renderdoc load has definitely happened.
@@ -85,10 +64,23 @@ namespace HRZR
 			return renderDocApi != nullptr;
 		}();
 
-		if (uiInitialized)
+		// Capture hotkey. Edge triggered, and only while this process owns the foreground window.
+		if (const auto key = ModConfiguration.RenderDoc.CaptureKey; renderDocApi && key > 0)
 		{
-			DebugUI::RenderUI();
-			DebugUI::RenderUID3D(NxD3DImpl::GetSingleton(), Thisptr);
+			static bool s_keyWasDown = false;
+
+			DWORD foregroundProcess = 0;
+			GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcess);
+
+			const bool keyDown = (GetAsyncKeyState(key) & 0x8000) != 0 && foregroundProcess == GetCurrentProcessId();
+
+			if (keyDown && !s_keyWasDown)
+			{
+				g_wantCapture.store(true);
+				spdlog::info("[RenderDoc] Capture queued for next NxDXGIImpl::Present");
+			}
+
+			s_keyWasDown = keyDown;
 		}
 
 		auto ret = OriginalPresent(Thisptr, a2);
@@ -127,8 +119,6 @@ namespace HRZR
 			s_capturing = true;
 			spdlog::info("[RenderDoc] StartFrameCapture — will end next present");
 		}
-
-
 
 		return ret;
 	}

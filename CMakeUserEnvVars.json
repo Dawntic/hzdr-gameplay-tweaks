@@ -5,8 +5,7 @@
       "name": "config-envvars",
       "hidden": true,
       "environment": {
-        "___GAME_ROOT_DIRECTORY": "C:/Program Files (x86)/Steam/steamapps/common/Horizon Zero Dawn Remastered",
-        "GAME_DEBUGGER_CMDLINE": "$env{GAME_ROOT_DIRECTORY}/HorizonZeroDawnRemastered.exe"
+        "___GAME_ROOT_DIRECTORY": "C:/Program Files (x86)/Steam/steamapps/common/Horizon Zero Dawn Remastered"
       }
     }
   ]

@@ -11,9 +11,7 @@ file(
 	"${SOURCE_DIR}/DllProxy/*.h"
 	"${SOURCE_DIR}/Hooking/*.h"
 	"${SOURCE_DIR}/HRZR/*.h"
-	"${SOURCE_DIR}/HRZR/Core/*.h"
 	"${SOURCE_DIR}/HRZR/PCore/*.h"
-	"${SOURCE_DIR}/HRZR/DebugUI/*.h"
 	"${SOURCE_DIR}/HRZR/Nx/*.h"
 	"${SOURCE_DIR}/*.h"
 )
@@ -25,9 +23,6 @@ file(
 	"${SOURCE_DIR}/DllProxy/*.cpp"
 	"${SOURCE_DIR}/Hooking/*.cpp"
 	"${SOURCE_DIR}/HRZR/*.cpp"
-	"${SOURCE_DIR}/HRZR/Core/*.cpp"
-	"${SOURCE_DIR}/HRZR/PCore/*.cpp"
-	"${SOURCE_DIR}/HRZR/DebugUI/*.cpp"
 	"${SOURCE_DIR}/HRZR/Nx/*.cpp"
 	"${SOURCE_DIR}/*.cpp"
 )
@@ -125,10 +120,6 @@ pkg_check_modules(tomlplusplus REQUIRED IMPORTED_TARGET tomlplusplus)
 # Detours
 find_package(detours CONFIG REQUIRED)
 target_link_libraries(${CURRENT_PROJECT} PRIVATE detours::detours)
-
-# Dear imgui
-find_package(imgui CONFIG REQUIRED)
-target_link_libraries(${CURRENT_PROJECT} PRIVATE imgui::imgui)
 
 #
 # Commands
