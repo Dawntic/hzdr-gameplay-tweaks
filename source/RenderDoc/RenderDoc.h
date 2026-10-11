@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <functional>
 #include <string>
 #include <Windows.h>
@@ -10,7 +9,6 @@ namespace RenderDoc
 {
 	// Null until renderdoc.dll has been loaded (or found already loaded) and its API acquired.
 	extern RENDERDOC_API_1_7_0 *Api;
-	extern std::atomic_bool WantCapture;
 
 	// True when the game was launched with -attach_renderdoc, i.e. the engine owns the RenderDoc attach.
 	bool EngineWillAttach();

@@ -22,7 +22,6 @@
 namespace RenderDoc
 {
 RENDERDOC_API_1_7_0 *Api = nullptr;
-std::atomic_bool WantCapture = false;
 
 
 // The engine has its own RenderDoc integration behind -attach_renderdoc (see the renderdoc.dll /
@@ -42,39 +41,6 @@ bool EngineWillAttach()
 
 	return commandLine.find(L"-attach_renderdoc") != std::wstring::npos;
 }
-
-#if defined(MOD_GAME_CRIMSON_DESERT)
-// RenderDoc shares the ASCII range with Windows virtual keys but numbers everything else itself.
-// Returns eRENDERDOC_Key_Max for keys it can't express.
-static RENDERDOC_InputButton RenderDocKeyFromVirtualKey(int VirtualKey)
-{
-	if ((VirtualKey >= '0' && VirtualKey <= '9') || (VirtualKey >= 'A' && VirtualKey <= 'Z'))
-		return static_cast<RENDERDOC_InputButton>(VirtualKey);
-
-	if (VirtualKey >= VK_F1 && VirtualKey <= VK_F12)
-		return static_cast<RENDERDOC_InputButton>(eRENDERDOC_Key_F1 + (VirtualKey - VK_F1));
-
-	switch (VirtualKey)
-	{
-	case VK_DIVIDE: return eRENDERDOC_Key_Divide;
-	case VK_MULTIPLY: return eRENDERDOC_Key_Multiply;
-	case VK_SUBTRACT: return eRENDERDOC_Key_Subtract;
-	case VK_ADD: return eRENDERDOC_Key_Plus;
-	case VK_HOME: return eRENDERDOC_Key_Home;
-	case VK_END: return eRENDERDOC_Key_End;
-	case VK_INSERT: return eRENDERDOC_Key_Insert;
-	case VK_DELETE: return eRENDERDOC_Key_Delete;
-	case VK_PRIOR: return eRENDERDOC_Key_PageUp;
-	case VK_NEXT: return eRENDERDOC_Key_PageDn;
-	case VK_BACK: return eRENDERDOC_Key_Backspace;
-	case VK_TAB: return eRENDERDOC_Key_Tab;
-	case VK_SNAPSHOT: return eRENDERDOC_Key_PrtScrn;
-	case VK_PAUSE: return eRENDERDOC_Key_Pause;
-	}
-
-	return eRENDERDOC_Key_Max;
-}
-#endif
 
 static bool AcquireRenderDocApi(HMODULE Module)
 {
@@ -104,22 +70,6 @@ static bool AcquireRenderDocApi(HMODULE Module)
 
 		Api->SetCaptureFilePathTemplate(capturePath.string().c_str());
 	}
-
-#if defined(MOD_GAME_CRIMSON_DESERT)
-	// No engine Present hook on this game to poll the key from, so hand it to RenderDoc, which checks its
-	// capture keys on every present of the swapchain it wrapped.
-	if (const auto key = RenderDocKeyFromVirtualKey(ModConfiguration.RenderDoc.CaptureKey); key != eRENDERDOC_Key_Max)
-	{
-		RENDERDOC_InputButton keys[] = { key };
-		Api->SetCaptureKeys(keys, 1);
-
-		spdlog::info("[RenderDoc] Capture key set to VK 0x{:X}", ModConfiguration.RenderDoc.CaptureKey);
-	}
-	else if (ModConfiguration.RenderDoc.CaptureKey > 0)
-	{
-		spdlog::warn("[RenderDoc] CaptureKey 0x{:X} has no RenderDoc equivalent, keeping RenderDoc's defaults", ModConfiguration.RenderDoc.CaptureKey);
-	}
-#endif
 
 	spdlog::info("[RenderDoc] API acquired. Capture template: {}", Api->GetCaptureFilePathTemplate());
 	return true;

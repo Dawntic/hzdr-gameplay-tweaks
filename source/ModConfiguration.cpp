@@ -120,7 +120,6 @@ namespace InternalModConfig
 			PARSE_TOML_RENDERDOC(renderDoc, WrapUnnamedLists);
 			PARSE_TOML_RENDERDOC(renderDoc, ShaderMarkers);
 			PARSE_TOML_RENDERDOC(renderDoc, EnginePassMarkers);
-			o.RenderDoc.CaptureKey = (*renderDoc)["CaptureKey"].value_or(-1);
 			PARSE_TOML_RENDERDOC(renderDoc, DllPath);
 			PARSE_TOML_RENDERDOC(renderDoc, CapturePath);
 		}

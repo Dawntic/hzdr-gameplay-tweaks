@@ -25,7 +25,6 @@ namespace InternalModConfig
 			bool WrapUnnamedLists;
 			bool ShaderMarkers;
 			bool EnginePassMarkers;
-			int CaptureKey;
 			std::string DllPath;
 			std::string CapturePath;
 		} RenderDoc;

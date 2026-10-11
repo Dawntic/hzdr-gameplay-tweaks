@@ -10,33 +10,6 @@
 namespace HRZR
 {
 
-	HWND GetGameWindow()
-	{
-		struct Data
-		{
-			DWORD pid;
-			HWND hwnd;
-		};
-		Data data = { GetCurrentProcessId(), nullptr };
-
-		EnumWindows(
-			[](HWND hwnd, LPARAM lParam) -> BOOL
-		{
-			auto *d = reinterpret_cast<Data *>(lParam);
-			DWORD pid = 0;
-			GetWindowThreadProcessId(hwnd, &pid);
-			if (pid == d->pid && IsWindowVisible(hwnd))
-			{
-				d->hwnd = hwnd;
-				return FALSE;
-			}
-			return TRUE;
-		},
-			reinterpret_cast<LPARAM>(&data));
-
-		return data.hwnd;
-	}
-
 	bool (*OriginalPresent)(NxDXGIImpl *DXGIImpl, void *a2);
 
 	bool HookedPresent(NxDXGIImpl *Thisptr, void *a2)
@@ -55,68 +28,12 @@ namespace HRZR
 				RenderPassNames::SetEnabled(true);
 
 			if (ModConfiguration.RenderDoc.Diagnostics)
-			{
 				RenderDocDiag::Report("first Present");
-			}
 
 			return RenderDoc::Api != nullptr;
 		}();
 
-		// Capture hotkey. Edge triggered, and only while this process owns the foreground window.
-		if (const auto key = ModConfiguration.RenderDoc.CaptureKey; RenderDoc::Api && key > 0)
-		{
-			static bool s_keyWasDown = false;
-
-			DWORD foregroundProcess = 0;
-			GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcess);
-
-			const bool keyDown = (GetAsyncKeyState(key) & 0x8000) != 0 && foregroundProcess == GetCurrentProcessId();
-
-			if (keyDown && !s_keyWasDown)
-			{
-				RenderDoc::WantCapture.store(true);
-				spdlog::info("[RenderDoc] Capture queued for next NxDXGIImpl::Present");
-			}
-
-			s_keyWasDown = keyDown;
-		}
-
-		auto ret = OriginalPresent(Thisptr, a2);
-
-		// Start/EndFrameCapture must be given the same device+window pair
-		static void *s_captureDevice = nullptr;
-		static HWND s_captureWindow = nullptr;
-		static bool s_capturing = false;
-
-		if (RenderDoc::Api && s_capturing)
-		{
-			s_capturing = false;
-			uint32_t result = RenderDoc::Api->EndFrameCapture(s_captureDevice, s_captureWindow);
-			spdlog::info("[RenderDoc] EndFrameCapture result: {} — total: {}", result, RenderDoc::Api->GetNumCaptures());
-		}
-
-		// Start capture AFTER present — captures everything in the next frame
-		if (RenderDoc::Api && RenderDoc::WantCapture.exchange(false))
-		{
-			auto *d3d = NxD3DImpl::GetSingleton();
-			auto *device = d3d->GetD3D12Device();
-
-			const auto vtable = *reinterpret_cast<void ***>(device);
-			spdlog::info(
-				"[RenderDoc] Capturing with device {:p}, vtable[0] owned by {}",
-				static_cast<void *>(device),
-				RenderDoc::OwnerOf(vtable[0]));
-
-			s_captureDevice = device;
-			s_captureWindow = GetGameWindow();
-
-			RenderDoc::Api->SetActiveWindow(s_captureDevice, s_captureWindow);
-			RenderDoc::Api->StartFrameCapture(s_captureDevice, s_captureWindow);
-			s_capturing = true;
-			spdlog::info("[RenderDoc] StartFrameCapture — will end next present");
-		}
-
-		return ret;
+		return OriginalPresent(Thisptr, a2);
 	}
 
 	DECLARE_HOOK_TRANSACTION(NxDXGIImpl)
