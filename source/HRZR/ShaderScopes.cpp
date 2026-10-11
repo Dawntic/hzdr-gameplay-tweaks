@@ -5,6 +5,8 @@
 #include <d3d12.h>
 #include <algorithm>
 #include <array>
+#include <format>
+#include <optional>
 #include <atomic>
 #include <cstddef>
 #include <mutex>
@@ -150,6 +152,15 @@ namespace ShaderScopes
 		Label += name;
 	}
 
+	// The container header's 16 byte digest identifies a shader no matter where its bytes were copied to
+	static void AppendShaderKey(std::string& Key, const D3D12_SHADER_BYTECODE& Bytecode)
+	{
+		const auto data = static_cast<const char *>(Bytecode.pShaderBytecode);
+
+		if (data && Bytecode.BytecodeLength >= 20 && memcmp(data, "DXBC", 4) == 0)
+			Key.append(data + 4, 16);
+	}
+
 	// Pipeline stream subobjects are laid out like d3dx12's CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT: the type,
 	// then the payload, the whole thing padded to pointer alignment.
 	template<typename T>
@@ -203,12 +214,13 @@ namespace ShaderScopes
 		return { 0, 0 };
 	}
 
-	static std::string LabelFromStream(const D3D12_PIPELINE_STATE_STREAM_DESC *Desc)
+	// Calls Visit(bytecode) for each shader stage in the stream, in pipeline order rather than whatever order
+	// the stream happens to list them in
+	static void ForEachStreamStage(const D3D12_PIPELINE_STATE_STREAM_DESC *Desc, auto&& Visit)
 	{
 		if (!Desc || !Desc->pPipelineStateSubobjectStream)
-			return {};
+			return;
 
-		// Stage order matches the pipeline rather than whatever order the stream happens to list them in
 		constexpr D3D12_PIPELINE_STATE_SUBOBJECT_TYPE stageOrder[] = {
 			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
 			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS,
@@ -234,15 +246,27 @@ namespace ShaderScopes
 			cursor += size;
 		}
 
-		std::string label;
-
 		for (const auto stage : stageOrder)
 		{
 			if (stages[stage])
-				AppendStage(label, *stages[stage]);
+				Visit(*stages[stage]);
 		}
+	}
+
+	static std::string LabelFromStream(const D3D12_PIPELINE_STATE_STREAM_DESC *Desc)
+	{
+		std::string label;
+		ForEachStreamStage(Desc, [&](const D3D12_SHADER_BYTECODE& Stage) { AppendStage(label, Stage); });
 
 		return label;
+	}
+
+	static std::string KeyFromStream(const D3D12_PIPELINE_STATE_STREAM_DESC *Desc)
+	{
+		std::string key;
+		ForEachStreamStage(Desc, [&](const D3D12_SHADER_BYTECODE& Stage) { AppendShaderKey(key, Stage); });
+
+		return key;
 	}
 
 	//
@@ -284,11 +308,38 @@ namespace ShaderScopes
 	static std::unordered_map<void **, DeviceVtable> g_DeviceVtables;
 	static std::unordered_map<void **, ListVtable> g_ListVtables;
 
+	// What a pipeline state is called: an optional section (the engine's render pass) and the scope inside it
+	struct PipelineInfo
+	{
+		std::string Section;
+		std::string Label;
+	};
+
 	static std::shared_mutex g_NameMutex;
-	static std::unordered_map<const void *, std::string> g_PipelineNames;
+	static std::unordered_map<const void *, PipelineInfo> g_PipelineNames;
+
+	// Engine names for pipelines being created right now on this thread, and for every shader combination the
+	// engine has asked for, in case the D3D12 call happens on another thread
+	struct EngineNames
+	{
+		std::string Pass;
+		std::string Name;
+	};
+
+	static thread_local std::optional<EngineNames> t_EngineContext;
+	static std::mutex g_EngineMutex;
+	static std::unordered_map<std::string, EngineNames> g_EngineByShaders;
+	static std::unordered_set<std::string> g_SeenPasses;
+
+	struct ListScopes
+	{
+		std::string Section;
+		bool SectionOpen = false;
+		bool ScopeOpen = false;
+	};
 
 	static std::mutex g_ScopeMutex;
-	static std::unordered_set<const void *> g_OpenScopes;
+	static std::unordered_map<const void *, ListScopes> g_ListScopes;
 
 	static void **VtableOf(const void *Object)
 	{
@@ -304,21 +355,134 @@ namespace ShaderScopes
 		return entry != Vtables.end() ? entry->second : typename Map::mapped_type {};
 	}
 
-	static void RememberPipeline(void **Pipeline, std::string Label)
+	static std::optional<EngineNames> EngineNamesFor(const std::string& ShaderKey, bool& FromThisThread)
 	{
-		if (!Pipeline || !*Pipeline || Label.empty())
-			return;
+		FromThisThread = t_EngineContext.has_value();
 
-		static std::atomic_uint32_t s_logged = 0;
+		if (FromThisThread)
+			return t_EngineContext;
 
-		if (s_logged.fetch_add(1) < 16)
-			spdlog::debug("[ShaderScopes] Pipeline {:p} = {}", *Pipeline, Label);
+		if (ShaderKey.empty())
+			return std::nullopt;
 
-		std::unique_lock lock(g_NameMutex);
-		g_PipelineNames.insert_or_assign(*Pipeline, std::move(Label));
+		std::lock_guard lock(g_EngineMutex);
+
+		const auto entry = g_EngineByShaders.find(ShaderKey);
+		return entry != g_EngineByShaders.end() ? std::optional(entry->second) : std::nullopt;
 	}
 
-	static std::string LabelOf(const void *Pipeline)
+	static void RememberPipeline(void **Pipeline, std::string Label, const std::string& ShaderKey)
+	{
+		if (!Pipeline || !*Pipeline)
+			return;
+
+		static std::atomic_uint32_t s_total = 0;
+		static std::atomic_uint32_t s_fromThread = 0;
+		static std::atomic_uint32_t s_fromShaders = 0;
+
+		PipelineInfo info { {}, std::move(Label) };
+		bool fromThisThread = false;
+
+		if (const auto engine = EngineNamesFor(ShaderKey, fromThisThread))
+		{
+			(fromThisThread ? s_fromThread : s_fromShaders)++;
+			info.Section = engine->Pass;
+
+			// The engine's own pipeline name leads, with the entry points kept for reference
+			if (!engine->Name.empty())
+				info.Label = info.Label.empty() ? engine->Name : std::format("{} [{}]", engine->Name, info.Label);
+
+			bool firstSighting = false;
+
+			if (!info.Section.empty())
+			{
+				std::lock_guard lock(g_EngineMutex);
+				firstSighting = g_SeenPasses.insert(info.Section).second;
+			}
+
+			if (firstSighting)
+				spdlog::info("[ShaderScopes] Render pass \"{}\"", info.Section);
+		}
+
+		// Enough to judge how well engine names are being matched, without logging every pipeline
+		if (const auto total = ++s_total; total == 64 || total == 512 || total % 2048 == 0)
+		{
+			const auto fromThread = s_fromThread.load();
+			const auto fromShaders = s_fromShaders.load();
+
+			spdlog::info(
+				"[ShaderScopes] {} pipelines created: {} matched to an engine pass on the same thread, {} by shader, {} unmatched",
+				total,
+				fromThread,
+				fromShaders,
+				total - fromThread - fromShaders);
+		}
+
+		// Who creates the pipelines that miss: the engine frames on the stack say which code path to hook. Only
+		// pipelines the exe asks for directly count (not FidelityFX, Streamline and the like), and each
+		// distinct call path is logged once.
+		static std::atomic_uint32_t s_tracedPaths = 0;
+
+		if (info.Section.empty() && s_tracedPaths.load() < 12)
+		{
+			void *frames[24] = {};
+			const auto count = RtlCaptureStackBackTrace(1, static_cast<DWORD>(std::size(frames)), frames, nullptr);
+			const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+
+			std::string trace;
+			std::string path;
+			bool sawExe = false;
+			bool thirdParty = false;
+			uint32_t exeFrames = 0;
+
+			for (USHORT i = 0; i < count; i++)
+			{
+				const auto owner = RenderDocDiag::OwnerOf(frames[i]);
+				const bool isExe = _stricmp(owner.c_str(), "CrimsonDesert.exe") == 0;
+
+				// Anything between our hook and the first exe frame other than the D3D12 layers means some
+				// middleware created this pipeline, not the engine
+				if (!sawExe && !isExe && _stricmp(owner.c_str(), "WINHTTP.dll") != 0 && _stricmp(owner.c_str(), "renderdoc.dll") != 0)
+					thirdParty = true;
+
+				sawExe |= isExe;
+
+				// Exe frames as preferred-base addresses so they match a disassembly of the file
+				if (isExe)
+				{
+					const auto address = reinterpret_cast<uintptr_t>(frames[i]) - exe + 0x140000000;
+					trace += std::format(" {:#x}", address);
+
+					if (exeFrames++ < 4)
+						path += std::format("{:x};", address);
+				}
+				else
+				{
+					trace += std::format(" {}", owner);
+				}
+			}
+
+			bool newPath = false;
+
+			if (sawExe && !thirdParty)
+			{
+				std::lock_guard lock(g_EngineMutex);
+				static std::unordered_set<std::string> s_paths;
+				newPath = s_paths.insert(path).second;
+			}
+
+			if (newPath && s_tracedPaths.fetch_add(1) < 12)
+				spdlog::info("[ShaderScopes] Unmatched pipeline \"{}\" (tid {}) created from:{}", info.Label, GetCurrentThreadId(), trace);
+		}
+
+		if (info.Section.empty() && info.Label.empty())
+			return;
+
+		std::unique_lock lock(g_NameMutex);
+		g_PipelineNames.insert_or_assign(*Pipeline, std::move(info));
+	}
+
+	static PipelineInfo InfoOf(const void *Pipeline)
 	{
 		if (!Pipeline)
 			return {};
@@ -326,29 +490,58 @@ namespace ShaderScopes
 		std::shared_lock lock(g_NameMutex);
 
 		const auto name = g_PipelineNames.find(Pipeline);
-		return name != g_PipelineNames.end() ? name->second : std::string {};
+		return name != g_PipelineNames.end() ? name->second : PipelineInfo {};
 	}
 
-	// Ends whatever scope is open on the list and, given a label, opens a new one. Recording calls happen
-	// outside the lock.
-	static void SwitchScope(ID3D12GraphicsCommandList *List, const std::string& Label)
+	// Moves the list's open scopes to match Info: the per-pipeline scope always closes, the section only when
+	// the pass changes. KeepSection leaves whatever section is open alone. Recording calls happen outside
+	// the lock.
+	static void SwitchScope(ID3D12GraphicsCommandList *List, const PipelineInfo& Info, bool KeepSection = false)
 	{
-		bool wasOpen = false;
+		uint32_t ends = 0;
+		bool beginSection = false;
+		bool beginScope = false;
 
 		{
 			std::lock_guard lock(g_ScopeMutex);
-			wasOpen = g_OpenScopes.erase(List) > 0;
+			auto& scopes = g_ListScopes[List];
 
-			if (!Label.empty())
-				g_OpenScopes.insert(List);
+			if (scopes.ScopeOpen)
+			{
+				scopes.ScopeOpen = false;
+				ends++;
+			}
+
+			if (!KeepSection)
+			{
+				if (scopes.SectionOpen && scopes.Section != Info.Section)
+				{
+					scopes.SectionOpen = false;
+					ends++;
+				}
+
+				if (!Info.Section.empty() && !scopes.SectionOpen)
+				{
+					scopes.Section = Info.Section;
+					scopes.SectionOpen = beginSection = true;
+				}
+			}
+
+			scopes.ScopeOpen = beginScope = !Info.Label.empty();
+
+			if (!scopes.SectionOpen && !scopes.ScopeOpen)
+				g_ListScopes.erase(List);
 		}
 
-		if (wasOpen)
+		for (uint32_t i = 0; i < ends; i++)
 			List->EndEvent();
 
 		// Metadata 1 is a plain ANSI string, which RenderDoc decodes
-		if (!Label.empty())
-			List->BeginEvent(1, Label.c_str(), static_cast<UINT>(Label.size() + 1));
+		if (beginSection)
+			List->BeginEvent(1, Info.Section.c_str(), static_cast<UINT>(Info.Section.size() + 1));
+
+		if (beginScope)
+			List->BeginEvent(1, Info.Label.c_str(), static_cast<UINT>(Info.Label.size() + 1));
 	}
 
 	//
@@ -372,14 +565,14 @@ namespace ShaderScopes
 		// than recording EndEvent on a closed list.
 		{
 			std::lock_guard lock(g_ScopeMutex);
-			g_OpenScopes.erase(This);
+			g_ListScopes.erase(This);
 		}
 
 		const auto result = original(This, Allocator, InitialState);
 
 		// Recording only begins once Reset has returned
 		if (SUCCEEDED(result) && InitialState)
-			SwitchScope(This, LabelOf(InitialState));
+			SwitchScope(This, InfoOf(InitialState));
 
 		return result;
 	}
@@ -389,7 +582,7 @@ namespace ShaderScopes
 		const auto original = OriginalsFor(g_ListVtables, This).SetPipelineState;
 
 		// Opened before the call so the SetPipelineState itself is the first event inside the scope
-		SwitchScope(This, LabelOf(Pipeline));
+		SwitchScope(This, InfoOf(Pipeline));
 		original(This, Pipeline);
 	}
 
@@ -397,8 +590,9 @@ namespace ShaderScopes
 	{
 		const auto original = OriginalsFor(g_ListVtables, This).SetPipelineState1;
 
-		// Raytracing state objects aren't parsed for export names yet
-		SwitchScope(This, StateObject ? "Raytracing" : "");
+		// Raytracing state objects aren't parsed for export names yet. They stay inside whatever pass is
+		// already open, since nothing says which pass they belong to.
+		SwitchScope(This, { {}, StateObject ? "Raytracing" : "" }, true);
 		original(This, StateObject);
 	}
 
@@ -474,11 +668,15 @@ namespace ShaderScopes
 		if (SUCCEEDED(result) && Desc)
 		{
 			std::string label;
+			std::string key;
 
 			for (const auto stage : { &Desc->VS, &Desc->HS, &Desc->DS, &Desc->GS, &Desc->PS })
+			{
 				AppendStage(label, *stage);
+				AppendShaderKey(key, *stage);
+			}
 
-			RememberPipeline(Pipeline, std::move(label));
+			RememberPipeline(Pipeline, std::move(label), key);
 		}
 
 		return result;
@@ -489,7 +687,12 @@ namespace ShaderScopes
 		const auto result = OriginalsFor(g_DeviceVtables, This).CreateComputePipelineState(This, Desc, Riid, Pipeline);
 
 		if (SUCCEEDED(result) && Desc)
-			RememberPipeline(Pipeline, EntryPointOf(Desc->CS));
+		{
+			std::string key;
+			AppendShaderKey(key, Desc->CS);
+
+			RememberPipeline(Pipeline, EntryPointOf(Desc->CS), key);
+		}
 
 		return result;
 	}
@@ -499,7 +702,7 @@ namespace ShaderScopes
 		const auto result = OriginalsFor(g_DeviceVtables, This).CreatePipelineState(This, Desc, Riid, Pipeline);
 
 		if (SUCCEEDED(result))
-			RememberPipeline(Pipeline, LabelFromStream(Desc));
+			RememberPipeline(Pipeline, LabelFromStream(Desc), KeyFromStream(Desc));
 
 		return result;
 	}
@@ -524,7 +727,7 @@ namespace ShaderScopes
 
 			if (InitialState && List && *List && SUCCEEDED(static_cast<IUnknown *>(*List)->QueryInterface(IID_PPV_ARGS(&list))))
 			{
-				SwitchScope(list, LabelOf(InitialState));
+				SwitchScope(list, InfoOf(InitialState));
 				list->Release();
 			}
 		}
@@ -647,5 +850,23 @@ namespace ShaderScopes
 
 		g_RealCreateDevice = reinterpret_cast<decltype(&D3D12CreateDevice)>(CreateDevice);
 		return reinterpret_cast<FARPROC>(&HookedD3D12CreateDevice);
+	}
+
+	void BeginEnginePipeline(const char *Pass, const char *Name, const D3D12_PIPELINE_STATE_STREAM_DESC *Stream)
+	{
+		EngineNames names { Pass ? Pass : "", Name ? Name : "" };
+
+		if (const auto key = KeyFromStream(Stream); !key.empty())
+		{
+			std::lock_guard lock(g_EngineMutex);
+			g_EngineByShaders.insert_or_assign(key, names);
+		}
+
+		t_EngineContext = std::move(names);
+	}
+
+	void EndEnginePipeline()
+	{
+		t_EngineContext.reset();
 	}
 }
