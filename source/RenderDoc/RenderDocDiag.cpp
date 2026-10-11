@@ -1,5 +1,5 @@
 #include "RenderDocDiag.h"
-#include "ShaderScopes.h"
+#include "RenderDoc.h"
 
 #define WIN32_NO_STATUS
 #include <Windows.h>
@@ -116,27 +116,6 @@ namespace RenderDocDiag
 		return std::filesystem::path(Value).filename().string();
 	}
 
-	// Which module does this address live in? "<none/trampoline>" means it isn't inside any loaded image,
-	// which for a function pointer usually means a trampoline allocated by a hooking library.
-	std::string OwnerOf(const void *Address)
-	{
-		if (!Address)
-			return "<null>";
-
-		HMODULE owner = nullptr;
-
-		if (!GetModuleHandleExW(
-				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-				reinterpret_cast<LPCWSTR>(Address),
-				&owner))
-			return "<none/trampoline>";
-
-		wchar_t path[MAX_PATH] {};
-		GetModuleFileNameW(owner, path, MAX_PATH);
-
-		return std::filesystem::path(path).filename().string();
-	}
-
 	static bool IsWatchedSymbol(const char *Name)
 	{
 		for (const auto s : WatchedSymbols)
@@ -159,25 +138,6 @@ namespace RenderDocDiag
 		return false;
 	}
 
-	static bool ValidPeHeaders(uintptr_t Base, PIMAGE_NT_HEADERS& OutNt)
-	{
-		if (!Base)
-			return false;
-
-		const auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(Base);
-
-		if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-			return false;
-
-		const auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(Base + dos->e_lfanew);
-
-		if (nt->Signature != IMAGE_NT_SIGNATURE)
-			return false;
-
-		OutNt = nt;
-		return true;
-	}
-
 	//
 	// Ground truth export lookup. Parsing the export directory by hand cannot be intercepted, so
 	// comparing this against GetProcAddress() tells us whether GetProcAddress is being redirected.
@@ -187,7 +147,7 @@ namespace RenderDocDiag
 		const auto base = reinterpret_cast<uintptr_t>(Module);
 		PIMAGE_NT_HEADERS nt = nullptr;
 
-		if (!ValidPeHeaders(base, nt))
+		if (!RenderDoc::ValidPeHeaders(base, nt))
 			return nullptr;
 
 		const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -217,68 +177,13 @@ namespace RenderDocDiag
 		return nullptr;
 	}
 
-	// Callback(ImportDllName, FunctionName, SlotAddress, IsDelayLoad)
-	static void ForEachImport(HMODULE Module, auto&& Callback)
-	{
-		const auto base = reinterpret_cast<uintptr_t>(Module);
-		PIMAGE_NT_HEADERS nt = nullptr;
-
-		if (!ValidPeHeaders(base, nt))
-			return;
-
-		if (const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]; dir.VirtualAddress)
-		{
-			for (auto desc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(base + dir.VirtualAddress); desc->Name; desc++)
-			{
-				const auto dllName = reinterpret_cast<const char *>(base + desc->Name);
-				const auto intRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
-
-				auto nameThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + intRva);
-				auto addrThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + desc->FirstThunk);
-
-				for (; nameThunk->u1.AddressOfData; nameThunk++, addrThunk++)
-				{
-					if (IMAGE_SNAP_BY_ORDINAL(nameThunk->u1.Ordinal))
-						continue;
-
-					const auto importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + nameThunk->u1.AddressOfData);
-					Callback(dllName, importByName->Name, reinterpret_cast<void **>(&addrThunk->u1.Function), false);
-				}
-			}
-		}
-
-		if (const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]; dir.VirtualAddress)
-		{
-			for (auto desc = reinterpret_cast<PIMAGE_DELAYLOAD_DESCRIPTOR>(base + dir.VirtualAddress); desc->DllNameRVA; desc++)
-			{
-				// Non-RVA based descriptors are ancient and would need different arithmetic
-				if (!desc->Attributes.RvaBased)
-					continue;
-
-				const auto dllName = reinterpret_cast<const char *>(base + desc->DllNameRVA);
-
-				auto nameThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + desc->ImportNameTableRVA);
-				auto addrThunk = reinterpret_cast<PIMAGE_THUNK_DATA>(base + desc->ImportAddressTableRVA);
-
-				for (; nameThunk->u1.AddressOfData; nameThunk++, addrThunk++)
-				{
-					if (IMAGE_SNAP_BY_ORDINAL(nameThunk->u1.Ordinal))
-						continue;
-
-					const auto importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(base + nameThunk->u1.AddressOfData);
-					Callback(dllName, importByName->Name, reinterpret_cast<void **>(&addrThunk->u1.Function), true);
-				}
-			}
-		}
-	}
-
 	// The GetProcAddress pointer the executable itself will call. If RenderDoc patched the exe's IAT this
 	// is renderdoc.dll; if it wasn't patched, RenderDoc can never intercept a by-name resolution.
 	static decltype(&::GetProcAddress) GetExeResolver()
 	{
 		decltype(&::GetProcAddress) result = nullptr;
 
-		ForEachImport(
+		RenderDoc::ForEachImport(
 			GetModuleHandleW(nullptr),
 			[&](const char *Dll, const char *Func, void **Slot, bool)
 		{
@@ -289,69 +194,14 @@ namespace RenderDocDiag
 		return result ? result : &::GetProcAddress;
 	}
 
-	// A GetProcAddress that RenderDoc intercepts, or null if none can be found. RenderDoc hooks by patching
-	// import tables, so any module's patched GetProcAddress slot will do. The exe's own slot isn't enough:
-	// in Crimson Desert it still holds the raw kernel32 export after RenderDoc loads (Denuvo is the likely
-	// culprit), so this mod's own import table, which RenderDoc patches too, is the fallback.
-	static decltype(&::GetProcAddress) GetRenderDocResolver()
-	{
-		HMODULE self = nullptr;
-		GetModuleHandleExW(
-			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			reinterpret_cast<LPCWSTR>(&GetRenderDocResolver),
-			&self);
-
-		for (const auto module : { GetModuleHandleW(nullptr), self })
-		{
-			decltype(&::GetProcAddress) result = nullptr;
-
-			ForEachImport(
-				module,
-				[&](const char *Dll, const char *Func, void **Slot, bool)
-			{
-				if (!result && _stricmp(Func, "GetProcAddress") == 0 && OwnerOf(*Slot) == "renderdoc.dll")
-					result = reinterpret_cast<decltype(&::GetProcAddress)>(*Slot);
-			});
-
-			if (result)
-				return result;
-		}
-
-		return nullptr;
-	}
-
 	//
 	// Trace hooks
 	//
 	static bool s_TraceInstalled = false;
 	static bool s_Trace = false;
-	static bool s_BypassStreamline = false;
 	static decltype(&::GetProcAddress) OrigGetProcAddress = nullptr;
 	static decltype(&::LoadLibraryExW) OrigLoadLibraryExW = nullptr;
 	static decltype(&::LoadLibraryExA) OrigLoadLibraryExA = nullptr;
-
-	// spdlog's sink takes a lock and touches the CRT; never re-enter it from a nested resolve
-	static thread_local bool t_InTrace = false;
-
-	struct TraceGuard
-	{
-		bool Entered = false;
-
-		TraceGuard()
-		{
-			if (!t_InTrace)
-			{
-				t_InTrace = true;
-				Entered = true;
-			}
-		}
-
-		~TraceGuard()
-		{
-			if (Entered)
-				t_InTrace = false;
-		}
-	};
 
 	// Some callers resolve the same export every frame (the Steam overlay polls CreateDXGIFactory*), which
 	// buried the log in identical lines. Only the first occurrence of each lookup says anything new.
@@ -364,196 +214,19 @@ namespace RenderDocDiag
 		return seen.insert(std::move(Key)).second;
 	}
 
-	//
-	// Streamline bypass.
-	//
-	// The game asks sl.interposer.dll for D3D12CreateDevice / CreateDXGIFactory* rather than asking
-	// d3d12.dll / dxgi.dll. RenderDoc only hooks the latter, and Streamline reaches the real runtime
-	// without going back through a hookable resolution, so RenderDoc never sees the device or the
-	// swapchain get created and ends up with zero frame capturers.
-	//
-	// Answering those lookups with the real module's export puts creation back on the path RenderDoc
-	// hooked. Streamline stays loaded and slInit still succeeds; it just no longer sits in front of
-	// device and swapchain creation, which is what costs frame generation.
-	//
-	static const wchar_t *StreamlineProxyHost(const char *Name)
-	{
-		constexpr const char *d3d12Symbols[] = {
-			"D3D12CreateDevice",
-			"D3D12GetDebugInterface",
-			"D3D12GetInterface",
-			"D3D12EnableExperimentalFeatures",
-		};
-
-		constexpr const char *dxgiSymbols[] = {
-			"CreateDXGIFactory",
-			"CreateDXGIFactory1",
-			"CreateDXGIFactory2",
-			"DXGIGetDebugInterface1",
-		};
-
-		for (const auto s : d3d12Symbols)
-		{
-			if (_stricmp(s, Name) == 0)
-				return L"d3d12.dll";
-		}
-
-		for (const auto s : dxgiSymbols)
-		{
-			if (_stricmp(s, Name) == 0)
-				return L"dxgi.dll";
-		}
-
-		return nullptr;
-	}
-
-	// Points the executable's static d3d12.dll / dxgi.dll imports at RenderDoc's hooks where they aren't
-	// already. If RenderDoc's import patches on the exe are missing, the game's own CreateDXGIFactory1/2 and
-	// D3D12GetInterface calls hand back unwrapped objects that then meet wrapped ones. Idempotent.
-	static void RepairExeImports(decltype(&::GetProcAddress) Resolver)
-	{
-		ForEachImport(
-			GetModuleHandleW(nullptr),
-			[&](const char *Dll, const char *Func, void **Slot, bool)
-		{
-			if (_stricmp(Dll, "d3d12.dll") != 0 && _stricmp(Dll, "dxgi.dll") != 0)
-				return;
-
-			const auto host = GetModuleHandleA(Dll);
-
-			if (!host || OwnerOf(*Slot) == "renderdoc.dll")
-				return;
-
-			const auto hooked = reinterpret_cast<void *>(Resolver(host, Func));
-
-			// RenderDoc doesn't hook everything (root signature serialization, say), and raw is correct there
-			if (!hooked || OwnerOf(hooked) != "renderdoc.dll")
-				return;
-
-			DWORD oldProtect = 0;
-
-			if (!VirtualProtect(Slot, sizeof(void *), PAGE_READWRITE, &oldProtect))
-			{
-				spdlog::error("[RDDiag] Cannot unprotect the exe import slot for {}!{}", Dll, Func);
-				return;
-			}
-
-			const auto previous = *Slot;
-			*Slot = hooked;
-			VirtualProtect(Slot, sizeof(void *), oldProtect, &oldProtect);
-
-			spdlog::info("[RDDiag] Exe import {}!{} was {:p} [{}], now RenderDoc's {:p}", Dll, Func, previous, OwnerOf(previous), hooked);
-		});
-	}
-
-	static bool IsStreamlineInterposer(HMODULE Module)
-	{
-		static HMODULE cached = nullptr;
-
-		if (!cached)
-			cached = GetModuleHandleW(L"sl.interposer.dll");
-
-		return cached && Module == cached;
-	}
-
-	static FARPROC RedirectStreamlineProxy(HMODULE Module, LPCSTR ProcName)
-	{
-		if (!IsStreamlineInterposer(Module))
-			return nullptr;
-
-		const auto hostName = StreamlineProxyHost(ProcName);
-
-		if (!hostName)
-			return nullptr;
-
-		// The host is normally already loaded by the time the engine gets here. LoadLibrary is a fallback;
-		// it's safe because this path is only reached from engine init, never from a DllMain.
-		auto host = GetModuleHandleW(hostName);
-
-		if (!host)
-			host = LoadLibraryW(hostName);
-
-		if (!host)
-			return nullptr;
-
-		// Resolve through a GetProcAddress RenderDoc intercepts, so the game gets RenderDoc's creation hooks
-		// rather than the raw exports. Handing out a raw D3D12CreateDevice while RenderDoc wraps everything
-		// else leaves the game with an unwrapped device fed wrapped objects, which crashes inside the driver.
-		const bool renderDocLoaded = GetModuleHandleW(L"renderdoc.dll") != nullptr;
-		decltype(&::GetProcAddress) resolver = &::GetProcAddress;
-
-		if (renderDocLoaded)
-		{
-			static const auto renderDocResolver = []()
-			{
-				const auto result = GetRenderDocResolver();
-
-				TraceGuard guard;
-
-				if (guard.Entered)
-				{
-					if (result)
-						RepairExeImports(result);
-					else
-						spdlog::error("[RDDiag] Streamline bypass disabled: no GetProcAddress hooked by RenderDoc found");
-				}
-
-				return result;
-			}();
-
-			// Without RenderDoc's resolver, staying on Streamline's path is the only consistent option
-			if (!renderDocResolver)
-				return nullptr;
-
-			resolver = renderDocResolver;
-		}
-
-		auto substitute = resolver(host, ProcName);
-
-		if (!substitute)
-			return nullptr;
-
-		TraceGuard guard;
-
-		if (guard.Entered)
-		{
-			spdlog::info(
-				"[RDDiag] Streamline bypass: sl.interposer!{} -> {}!{} = {:p} [{}]",
-				ProcName,
-				Narrow(hostName),
-				ProcName,
-				reinterpret_cast<void *>(substitute),
-				OwnerOf(reinterpret_cast<void *>(substitute)));
-		}
-
-		// Every device the game creates comes through here, which is where the shader scopes find the
-		// vtables they need
-		if (ShaderScopes::IsEnabled() && _stricmp(ProcName, "D3D12CreateDevice") == 0)
-			substitute = ShaderScopes::WrapCreateDevice(substitute);
-
-		return substitute;
-	}
-
 	static FARPROC WINAPI HookedGetProcAddress(HMODULE Module, LPCSTR ProcName)
 	{
-		// HIWORD == 0 means resolution by ordinal, where ProcName is not a pointer
-		if (s_BypassStreamline && HIWORD(ProcName) != 0)
-		{
-			if (const auto substitute = RedirectStreamlineProxy(Module, ProcName))
-				return substitute;
-		}
-
 		const auto result = OrigGetProcAddress(Module, ProcName);
 
 		if (s_Trace && HIWORD(ProcName) != 0 && IsWatchedSymbol(ProcName))
 		{
-			TraceGuard guard;
+			RenderDoc::LogGuard guard;
 
 			if (guard.Entered)
 			{
-				const auto module = OwnerOf(Module);
-				const auto owner = OwnerOf(reinterpret_cast<void *>(result));
-				const auto caller = OwnerOf(_ReturnAddress());
+				const auto module = RenderDoc::OwnerOf(Module);
+				const auto owner = RenderDoc::OwnerOf(reinterpret_cast<void *>(result));
+				const auto caller = RenderDoc::OwnerOf(_ReturnAddress());
 
 				if (FirstSighting(std::format("gpa|{}|{}|{}|{}", module, ProcName, owner, caller)))
 				{
@@ -581,49 +254,21 @@ namespace RenderDocDiag
 		if (!IsWatchedModule(base))
 			return;
 
-		TraceGuard guard;
+		RenderDoc::LogGuard guard;
 
 		if (guard.Entered)
 		{
-			const auto caller = OwnerOf(ReturnAddress);
+			const auto caller = RenderDoc::OwnerOf(ReturnAddress);
 
 			if (FirstSighting(std::format("load|{}|{}|{}", Narrow(base), static_cast<void *>(Result), caller)))
 				spdlog::info("[RDDiag] LoadLibrary(\"{}\") -> {:p}  caller={}", Narrow(base), static_cast<void *>(Result), caller);
 		}
 	}
 
-	// Graphics runtime loads only happen once the game itself is running, after anything that rewrites the
-	// exe's import table at startup has finished. That makes them the earliest dependable point to repair it.
-	static void RepairOnGraphicsLoad(const wchar_t *Name)
-	{
-		if (!s_BypassStreamline || !Name)
-			return;
-
-		const auto base = std::filesystem::path(Name).filename().wstring();
-
-		if (_wcsicmp(base.c_str(), L"d3d12.dll") != 0 && _wcsicmp(base.c_str(), L"D3D12Core.dll") != 0 &&
-			_wcsicmp(base.c_str(), L"dxgi.dll") != 0 && _wcsicmp(base.c_str(), L"sl.interposer.dll") != 0)
-			return;
-
-		if (!GetModuleHandleW(L"renderdoc.dll"))
-			return;
-
-		TraceGuard guard;
-
-		if (!guard.Entered)
-			return;
-
-		if (const auto resolver = GetRenderDocResolver())
-			RepairExeImports(resolver);
-	}
-
 	static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR FileName, HANDLE File, DWORD Flags)
 	{
 		const auto result = OrigLoadLibraryExW(FileName, File, Flags);
 		TraceLoad(FileName, result, _ReturnAddress());
-
-		if (result)
-			RepairOnGraphicsLoad(FileName);
 
 		return result;
 	}
@@ -636,18 +281,14 @@ namespace RenderDocDiag
 		{
 			const auto wide = std::filesystem::path(FileName).wstring();
 			TraceLoad(wide.c_str(), result, _ReturnAddress());
-
-			if (result)
-				RepairOnGraphicsLoad(wide.c_str());
 		}
 
 		return result;
 	}
 
-	void InstallTraceHooks(bool Trace, bool BypassStreamline)
+	void InstallTraceHooks(bool Trace)
 	{
 		s_Trace = Trace;
-		s_BypassStreamline = BypassStreamline;
 
 		if (s_TraceInstalled)
 			return;
@@ -685,7 +326,7 @@ namespace RenderDocDiag
 		}
 
 		s_TraceInstalled = true;
-		spdlog::info("[RDDiag] Interceptors installed (trace={}, streamline bypass={})", Trace, BypassStreamline);
+		spdlog::info("[RDDiag] Interceptors installed (trace={})", Trace);
 	}
 
 	//
@@ -735,7 +376,7 @@ namespace RenderDocDiag
 		spdlog::info(
 			"[RDDiag]   kernel32!GetProcAddress export = {:p} [{}]",
 			reinterpret_cast<void *>(realGetProcAddress),
-			OwnerOf(reinterpret_cast<void *>(realGetProcAddress)));
+			RenderDoc::OwnerOf(reinterpret_cast<void *>(realGetProcAddress)));
 
 		// Per-module IAT ownership of the resolver functions. Anything not owned by KERNELBASE/kernel32
 		// has been redirected by somebody; we want to see renderdoc.dll here for the exe at minimum.
@@ -747,7 +388,7 @@ namespace RenderDocDiag
 			if (!isExe && !IsWatchedModule(Name))
 				return;
 
-			ForEachImport(
+			RenderDoc::ForEachImport(
 				static_cast<HMODULE>(Base),
 				[&](const char *Dll, const char *Func, void **Slot, bool Delay)
 			{
@@ -765,7 +406,7 @@ namespace RenderDocDiag
 					Delay ? " (delay)" : "",
 					static_cast<void *>(Slot),
 					*Slot,
-					OwnerOf(*Slot));
+					RenderDoc::OwnerOf(*Slot));
 			});
 		});
 	}
@@ -776,7 +417,7 @@ namespace RenderDocDiag
 		spdlog::info("[RDDiag]   (raw = parsed from the export directory, gpa = ::GetProcAddress, exe = the exe's own resolver)");
 
 		const auto exeResolver = GetExeResolver();
-		spdlog::info("[RDDiag]   exe resolver = {:p} [{}]", reinterpret_cast<void *>(exeResolver), OwnerOf(reinterpret_cast<void *>(exeResolver)));
+		spdlog::info("[RDDiag]   exe resolver = {:p} [{}]", reinterpret_cast<void *>(exeResolver), RenderDoc::OwnerOf(reinterpret_cast<void *>(exeResolver)));
 
 		struct Target
 		{
@@ -817,11 +458,11 @@ namespace RenderDocDiag
 				Narrow(target.Module),
 				target.Symbol,
 				raw,
-				OwnerOf(raw),
+				RenderDoc::OwnerOf(raw),
 				gpa,
-				OwnerOf(gpa),
+				RenderDoc::OwnerOf(gpa),
 				exe,
-				OwnerOf(exe),
+				RenderDoc::OwnerOf(exe),
 				(gpa != raw || exe != raw) ? "<== REDIRECTED" : "");
 		}
 	}
@@ -835,7 +476,7 @@ namespace RenderDocDiag
 		ForEachLoadedModule(
 			[&](uint32_t, const std::wstring& Name, void *Base, uint32_t)
 		{
-			ForEachImport(
+			RenderDoc::ForEachImport(
 				static_cast<HMODULE>(Base),
 				[&](const char *Dll, const char *Func, void **Slot, bool Delay)
 			{
@@ -851,7 +492,7 @@ namespace RenderDocDiag
 					Delay ? " (delay)" : "",
 					static_cast<void *>(Slot),
 					*Slot,
-					OwnerOf(*Slot));
+					RenderDoc::OwnerOf(*Slot));
 			});
 		});
 
@@ -889,7 +530,7 @@ namespace RenderDocDiag
 			spdlog::info(
 				"[RDDiag]   CreateDXGIFactory2 = {:p} [{}]",
 				reinterpret_cast<void *>(create),
-				OwnerOf(reinterpret_cast<void *>(create)));
+				RenderDoc::OwnerOf(reinterpret_cast<void *>(create)));
 
 			if (create)
 			{
@@ -898,7 +539,7 @@ namespace RenderDocDiag
 				if (const auto hr = create(0, IID_PPV_ARGS(&factory)); SUCCEEDED(hr) && factory)
 				{
 					const auto vtable = *reinterpret_cast<void ***>(factory);
-					spdlog::info("[RDDiag]   IDXGIFactory2 vtable[0] = {:p} [{}]", vtable[0], OwnerOf(vtable[0]));
+					spdlog::info("[RDDiag]   IDXGIFactory2 vtable[0] = {:p} [{}]", vtable[0], RenderDoc::OwnerOf(vtable[0]));
 					factory->Release();
 				}
 				else
@@ -919,7 +560,7 @@ namespace RenderDocDiag
 			spdlog::info(
 				"[RDDiag]   D3D12CreateDevice = {:p} [{}]",
 				reinterpret_cast<void *>(create),
-				OwnerOf(reinterpret_cast<void *>(create)));
+				RenderDoc::OwnerOf(reinterpret_cast<void *>(create)));
 
 			if (create)
 			{
@@ -928,10 +569,10 @@ namespace RenderDocDiag
 				if (const auto hr = create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)); SUCCEEDED(hr) && device)
 				{
 					const auto vtable = *reinterpret_cast<void ***>(device);
-					spdlog::info("[RDDiag]   ID3D12Device vtable[0] = {:p} [{}]", vtable[0], OwnerOf(vtable[0]));
+					spdlog::info("[RDDiag]   ID3D12Device vtable[0] = {:p} [{}]", vtable[0], RenderDoc::OwnerOf(vtable[0]));
 					spdlog::info(
 						"[RDDiag]   => RenderDoc's D3D12 hooks are {}",
-						OwnerOf(vtable[0]) == "renderdoc.dll" ? "LIVE (so the game bypasses them)" : "NOT INSTALLED");
+						RenderDoc::OwnerOf(vtable[0]) == "renderdoc.dll" ? "LIVE (so the game bypasses them)" : "NOT INSTALLED");
 					device->Release();
 				}
 				else
@@ -992,7 +633,7 @@ namespace RenderDocDiag
 			if (!IsReadable(vtable, sizeof(void *)))
 				continue;
 
-			const auto owner = OwnerOf(vtable[0]);
+			const auto owner = RenderDoc::OwnerOf(vtable[0]);
 
 			// Only interesting if it belongs to a graphics module or a hooking trampoline
 			if (owner != "renderdoc.dll" && owner != "dxgi.dll" && owner != "d3d12.dll" && owner != "D3D12Core.dll" &&
@@ -1010,151 +651,5 @@ namespace RenderDocDiag
 
 		ScanObjectFields("NxD3DImpl", NxD3DImplPtr, 256);
 		ScanObjectFields("NxDXGIImpl", NxDXGIImplPtr, 256);
-	}
-
-	//
-	// AGS marker bridge
-	//
-	// AGS is the only marker API this executable references, so if the engine emits anything it comes
-	// through here. We sit under RenderDoc's IAT patch, so we observe the calls the game actually makes.
-	// Forwarding re-emits them as PIX ANSI events (metadata 1), which RenderDoc decodes into the event
-	// browser tree.
-	//
-	// Params left opaque on purpose: the AGS struct layouts move between SDK versions and we only need to
-	// know whether the engine calls these and what they answer, not what is inside them.
-	using AgsInitialize_t = int(__cdecl *)(int, const void *, void **, void *);
-	using AgsDX12CreateDevice_t = int(__cdecl *)(void *, const void *, const void *, void *);
-
-	using AgsPushMarker_t = int(__cdecl *)(void *, ID3D12GraphicsCommandList *, const char *);
-	using AgsPopMarker_t = int(__cdecl *)(void *, ID3D12GraphicsCommandList *);
-	using AgsSetMarker_t = int(__cdecl *)(void *, ID3D12GraphicsCommandList *, const char *);
-
-	static AgsInitialize_t OrigAgsInitialize = nullptr;
-	static AgsDX12CreateDevice_t OrigAgsDX12CreateDevice = nullptr;
-	static AgsPushMarker_t OrigAgsPushMarker = nullptr;
-	static AgsPopMarker_t OrigAgsPopMarker = nullptr;
-	static AgsSetMarker_t OrigAgsSetMarker = nullptr;
-
-	static bool s_AgsTrace = false;
-	static bool s_AgsForward = false;
-	static std::atomic_uint32_t s_AgsCallCount = 0;
-
-	// Enough to prove whether the engine emits markers at all without drowning the log every frame
-	static constexpr uint32_t AgsTraceLimit = 64;
-
-	static void TraceAgsCall(const char *Which, const char *Data)
-	{
-		const auto count = s_AgsCallCount.fetch_add(1);
-
-		if (!s_AgsTrace || count >= AgsTraceLimit)
-			return;
-
-		TraceGuard guard;
-
-		if (guard.Entered)
-			spdlog::info("[RDDiag] AGS marker #{}: {}(\"{}\")", count, Which, Data ? Data : "");
-	}
-
-	static int __cdecl HookedAgsInitialize(int Version, const void *Config, void **Context, void *GpuInfo)
-	{
-		const auto result = OrigAgsInitialize(Version, Config, Context, GpuInfo);
-
-		TraceGuard guard;
-
-		if (guard.Entered)
-			spdlog::info("[RDDiag] agsInitialize(version={}) -> {} (0 == AGS_SUCCESS)", Version, result);
-
-		return result;
-	}
-
-	static int __cdecl HookedAgsDX12CreateDevice(void *Context, const void *CreationParams, const void *ExtensionParams, void *Returned)
-	{
-		const auto result = OrigAgsDX12CreateDevice(Context, CreationParams, ExtensionParams, Returned);
-
-		TraceGuard guard;
-
-		if (guard.Entered)
-			spdlog::info("[RDDiag] agsDriverExtensionsDX12_CreateDevice() -> {} (0 == AGS_SUCCESS)", result);
-
-		return result;
-	}
-
-	static int __cdecl HookedAgsPushMarker(void *Context, ID3D12GraphicsCommandList *CommandList, const char *Data)
-	{
-		TraceAgsCall("PushMarker", Data);
-
-		if (s_AgsForward && CommandList && Data)
-			CommandList->BeginEvent(1, Data, static_cast<UINT>(strlen(Data) + 1));
-
-		return OrigAgsPushMarker(Context, CommandList, Data);
-	}
-
-	static int __cdecl HookedAgsPopMarker(void *Context, ID3D12GraphicsCommandList *CommandList)
-	{
-		TraceAgsCall("PopMarker", nullptr);
-
-		if (s_AgsForward && CommandList)
-			CommandList->EndEvent();
-
-		return OrigAgsPopMarker(Context, CommandList);
-	}
-
-	static int __cdecl HookedAgsSetMarker(void *Context, ID3D12GraphicsCommandList *CommandList, const char *Data)
-	{
-		TraceAgsCall("SetMarker", Data);
-
-		if (s_AgsForward && CommandList && Data)
-			CommandList->SetMarker(1, Data, static_cast<UINT>(strlen(Data) + 1));
-
-		return OrigAgsSetMarker(Context, CommandList, Data);
-	}
-
-	void InstallAgsMarkerBridge(bool Trace, bool Forward)
-	{
-		s_AgsTrace = Trace;
-		s_AgsForward = Forward;
-
-		static bool installed = false;
-
-		if (installed)
-			return;
-
-		const auto ags = GetModuleHandleW(L"amd_ags_x64.dll");
-
-		if (!ags)
-		{
-			spdlog::warn("[RDDiag] amd_ags_x64.dll not loaded, cannot bridge AGS markers");
-			return;
-		}
-
-		// Resolved raw so we hook the real implementation rather than whatever sits in front of it
-		OrigAgsInitialize = reinterpret_cast<AgsInitialize_t>(RawExportLookup(ags, "agsInitialize"));
-		OrigAgsDX12CreateDevice = reinterpret_cast<AgsDX12CreateDevice_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_CreateDevice"));
-		OrigAgsPushMarker = reinterpret_cast<AgsPushMarker_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_PushMarker"));
-		OrigAgsPopMarker = reinterpret_cast<AgsPopMarker_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_PopMarker"));
-		OrigAgsSetMarker = reinterpret_cast<AgsSetMarker_t>(RawExportLookup(ags, "agsDriverExtensionsDX12_SetMarker"));
-
-		if (!OrigAgsInitialize || !OrigAgsDX12CreateDevice || !OrigAgsPushMarker || !OrigAgsPopMarker || !OrigAgsSetMarker)
-		{
-			spdlog::warn("[RDDiag] AGS marker exports missing");
-			return;
-		}
-
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		DetourAttach(reinterpret_cast<void **>(&OrigAgsInitialize), &HookedAgsInitialize);
-		DetourAttach(reinterpret_cast<void **>(&OrigAgsDX12CreateDevice), &HookedAgsDX12CreateDevice);
-		DetourAttach(reinterpret_cast<void **>(&OrigAgsPushMarker), &HookedAgsPushMarker);
-		DetourAttach(reinterpret_cast<void **>(&OrigAgsPopMarker), &HookedAgsPopMarker);
-		DetourAttach(reinterpret_cast<void **>(&OrigAgsSetMarker), &HookedAgsSetMarker);
-
-		if (DetourTransactionCommit() != NO_ERROR)
-		{
-			spdlog::error("[RDDiag] Failed to commit AGS marker transaction");
-			return;
-		}
-
-		installed = true;
-		spdlog::info("[RDDiag] AGS marker bridge installed (trace={}, forward={})", Trace, Forward);
 	}
 }

@@ -1,4 +1,4 @@
-#include "../HRZR/ShaderScopes.h"
+#include "../RenderDoc/ShaderScopes.h"
 #include "../ModConfiguration.h"
 
 #include <d3d12.h>

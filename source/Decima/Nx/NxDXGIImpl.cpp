@@ -2,8 +2,8 @@
 #include "NxD3DImpl.h"
 #include "NxDXGIImpl.h"
 
-#include "../../test.h"
-#include "../RenderDocDiag.h"
+#include "../../RenderDoc/RenderDoc.h"
+#include "../../RenderDoc/RenderDocDiag.h"
 #include "../RenderPassNames.h"
 #include <Windows.h>
 
@@ -46,8 +46,8 @@ namespace HRZR
 		// own -attach_renderdoc load has definitely happened.
 		const static bool renderDocReady = [&]()
 		{
-			if (!renderDocApi)
-				AttachToLoadedRenderDoc();
+			if (!RenderDoc::Api)
+				RenderDoc::AttachToLoaded();
 
 			// Must happen here, not at mod init: the executable's CRT initializers zero this flag and they
 			// run after our DllMain.
@@ -61,11 +61,11 @@ namespace HRZR
 				RenderDocDiag::ProbeCreation();
 			}
 
-			return renderDocApi != nullptr;
+			return RenderDoc::Api != nullptr;
 		}();
 
 		// Capture hotkey. Edge triggered, and only while this process owns the foreground window.
-		if (const auto key = ModConfiguration.RenderDoc.CaptureKey; renderDocApi && key > 0)
+		if (const auto key = ModConfiguration.RenderDoc.CaptureKey; RenderDoc::Api && key > 0)
 		{
 			static bool s_keyWasDown = false;
 
@@ -76,7 +76,7 @@ namespace HRZR
 
 			if (keyDown && !s_keyWasDown)
 			{
-				g_wantCapture.store(true);
+				RenderDoc::WantCapture.store(true);
 				spdlog::info("[RenderDoc] Capture queued for next NxDXGIImpl::Present");
 			}
 
@@ -90,15 +90,15 @@ namespace HRZR
 		static HWND s_captureWindow = nullptr;
 		static bool s_capturing = false;
 
-		if (renderDocApi && s_capturing)
+		if (RenderDoc::Api && s_capturing)
 		{
 			s_capturing = false;
-			uint32_t result = renderDocApi->EndFrameCapture(s_captureDevice, s_captureWindow);
-			spdlog::info("[RenderDoc] EndFrameCapture result: {} — total: {}", result, renderDocApi->GetNumCaptures());
+			uint32_t result = RenderDoc::Api->EndFrameCapture(s_captureDevice, s_captureWindow);
+			spdlog::info("[RenderDoc] EndFrameCapture result: {} — total: {}", result, RenderDoc::Api->GetNumCaptures());
 		}
 
 		// Start capture AFTER present — captures everything in the next frame
-		if (renderDocApi && g_wantCapture.exchange(false))
+		if (RenderDoc::Api && RenderDoc::WantCapture.exchange(false))
 		{
 			auto *d3d = NxD3DImpl::GetSingleton();
 			auto *device = d3d->GetD3D12Device();
@@ -109,13 +109,13 @@ namespace HRZR
 			spdlog::info(
 				"[RenderDoc] Capturing with device {:p}, vtable[0] owned by {}",
 				static_cast<void *>(device),
-				RenderDocDiag::OwnerOf(vtable[0]));
+				RenderDoc::OwnerOf(vtable[0]));
 
 			s_captureDevice = device;
 			s_captureWindow = GetGameWindow();
 
-			renderDocApi->SetActiveWindow(s_captureDevice, s_captureWindow);
-			renderDocApi->StartFrameCapture(s_captureDevice, s_captureWindow);
+			RenderDoc::Api->SetActiveWindow(s_captureDevice, s_captureWindow);
+			RenderDoc::Api->StartFrameCapture(s_captureDevice, s_captureWindow);
 			s_capturing = true;
 			spdlog::info("[RenderDoc] StartFrameCapture — will end next present");
 		}

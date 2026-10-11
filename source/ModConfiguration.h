@@ -19,7 +19,6 @@ namespace InternalModConfig
 			bool Diagnostics;
 			bool BypassStreamline;
 			bool RedirectEngineLoad;
-			bool TranslateAgsMarkers;
 			bool NameCommandLists;
 			bool LogCommandListNames;
 			bool EmitPassMarkers;

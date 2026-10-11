@@ -14,14 +14,9 @@
 //
 namespace RenderDocDiag
 {
-	// Detour GetProcAddress/LoadLibrary*. Must be called BEFORE renderdoc.dll is loaded so that we sit
-	// underneath RenderDoc's own IAT patches and observe every resolution attempt.
-	//
-	//   Trace            - log every watched symbol resolution.
-	//   BypassStreamline - answer the game's sl.interposer.dll D3D12/DXGI proxy lookups with the real
-	//                      d3d12.dll/dxgi.dll exports instead. Those are the ones RenderDoc hooks, so this
-	//                      is what makes capture possible. Costs DLSS frame generation.
-	void InstallTraceHooks(bool Trace, bool BypassStreamline);
+	// Detour GetProcAddress/LoadLibrary* to log watched resolutions. Must be called BEFORE renderdoc.dll is
+	// loaded so that we sit underneath RenderDoc's own IAT patches and observe every resolution attempt.
+	void InstallTraceHooks(bool Trace);
 
 	// Full snapshot: module load order, IAT ownership, export resolution truth table.
 	void Report(const char *Phase);
@@ -33,12 +28,4 @@ namespace RenderDocDiag
 
 	// Report the owning module of the vtables of the live objects the game is actually rendering with.
 	void ReportLiveObjects(void *NxD3DImplPtr, void *NxDXGIImplPtr);
-
-	// The engine routes its GPU debug markers through AMD AGS, which only does anything on an AMD device
-	// created via agsDriverExtensionsDX12_CreateDevice. Trace those calls, and optionally re-emit them as
-	// PIX events on the command list so RenderDoc shows them as frame annotations.
-	void InstallAgsMarkerBridge(bool Trace, bool Forward);
-
-	// Name of the module an address lives in, or "<none/trampoline>" if it isn't inside a loaded image.
-	std::string OwnerOf(const void *Address);
 }

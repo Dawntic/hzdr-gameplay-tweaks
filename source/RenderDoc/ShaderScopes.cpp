@@ -1,5 +1,5 @@
 #include "ShaderScopes.h"
-#include "RenderDocDiag.h"
+#include "RenderDoc.h"
 #include "../ModConfiguration.h"
 
 #include <d3d12.h>
@@ -437,7 +437,7 @@ namespace ShaderScopes
 
 			for (USHORT i = 0; i < count; i++)
 			{
-				const auto owner = RenderDocDiag::OwnerOf(frames[i]);
+				const auto owner = RenderDoc::OwnerOf(frames[i]);
 				const bool isExe = _stricmp(owner.c_str(), "CrimsonDesert.exe") == 0;
 
 				// Anything between our hook and the first exe frame other than the D3D12 layers means some
@@ -651,7 +651,7 @@ namespace ShaderScopes
 		spdlog::info(
 			"[ShaderScopes] Hooked command list vtable {:p} [{}] (Close={}, Reset={}, SetPipelineState={}, SetPipelineState1={})",
 			static_cast<void *>(vtable),
-			RenderDocDiag::OwnerOf(vtable[0]),
+			RenderDoc::OwnerOf(vtable[0]),
 			closeSlot,
 			resetSlot,
 			setPipelineSlot,
@@ -811,7 +811,7 @@ namespace ShaderScopes
 			"[ShaderScopes] Hooked device vtable {:p} [{}] (CreateGraphicsPipelineState={}, CreateComputePipelineState={}, CreateCommandList={}, "
 			"CreatePipelineState={}, CreateCommandList1={})",
 			static_cast<void *>(vtable),
-			RenderDocDiag::OwnerOf(vtable[0]),
+			RenderDoc::OwnerOf(vtable[0]),
 			graphicsSlot,
 			computeSlot,
 			listSlot,

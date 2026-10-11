@@ -114,7 +114,6 @@ namespace InternalModConfig
 			PARSE_TOML_RENDERDOC(renderDoc, Diagnostics);
 			PARSE_TOML_RENDERDOC(renderDoc, BypassStreamline);
 			PARSE_TOML_RENDERDOC(renderDoc, RedirectEngineLoad);
-			PARSE_TOML_RENDERDOC(renderDoc, TranslateAgsMarkers);
 			PARSE_TOML_RENDERDOC(renderDoc, NameCommandLists);
 			PARSE_TOML_RENDERDOC(renderDoc, LogCommandListNames);
 			PARSE_TOML_RENDERDOC(renderDoc, EmitPassMarkers);

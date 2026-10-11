@@ -10,9 +10,10 @@ file(
 	CONFIGURE_DEPENDS
 	"${SOURCE_DIR}/DllProxy/*.h"
 	"${SOURCE_DIR}/Hooking/*.h"
-	"${SOURCE_DIR}/HRZR/*.h"
-	"${SOURCE_DIR}/HRZR/PCore/*.h"
-	"${SOURCE_DIR}/HRZR/Nx/*.h"
+	"${SOURCE_DIR}/RenderDoc/*.h"
+	"${SOURCE_DIR}/Decima/*.h"
+	"${SOURCE_DIR}/Decima/PCore/*.h"
+	"${SOURCE_DIR}/Decima/Nx/*.h"
 	"${SOURCE_DIR}/*.h"
 )
 
@@ -22,22 +23,23 @@ file(
 	CONFIGURE_DEPENDS
 	"${SOURCE_DIR}/DllProxy/*.cpp"
 	"${SOURCE_DIR}/Hooking/*.cpp"
-	"${SOURCE_DIR}/HRZR/*.cpp"
-	"${SOURCE_DIR}/HRZR/Nx/*.cpp"
-	"${SOURCE_DIR}/CrimsonDesert/*.cpp"
+	"${SOURCE_DIR}/RenderDoc/*.cpp"
+	"${SOURCE_DIR}/Decima/*.cpp"
+	"${SOURCE_DIR}/Decima/Nx/*.cpp"
+	"${SOURCE_DIR}/BlackSpace/*.cpp"
 	"${SOURCE_DIR}/*.cpp"
 )
 
 # Which game the DLL is built for. Everything that hooks Decima internals by signature (the NxDXGIImpl
 # Present hook, command list naming) only exists for HZDR. Other games get the engine-agnostic RenderDoc
-# setup only: early load, Streamline bypass, diagnostics. Crimson Desert's own engine hooks live in CrimsonDesert/.
+# setup only: early load, Streamline bypass, diagnostics. Crimson Desert's own engine hooks live in BlackSpace/.
 set(MOD_TARGET_GAME "HZDR" CACHE STRING "Game to build for: HZDR or CrimsonDesert")
 set_property(CACHE MOD_TARGET_GAME PROPERTY STRINGS HZDR CrimsonDesert)
 
 if(MOD_TARGET_GAME STREQUAL "CrimsonDesert")
-	list(FILTER SOURCE_FILES EXCLUDE REGEX "/HRZR/(Nx/.*|RenderPassNames)\\.cpp$")
+	list(FILTER SOURCE_FILES EXCLUDE REGEX "/Decima/.*\\.cpp$")
 elseif(MOD_TARGET_GAME STREQUAL "HZDR")
-	list(FILTER SOURCE_FILES EXCLUDE REGEX "/CrimsonDesert/.*\\.cpp$")
+	list(FILTER SOURCE_FILES EXCLUDE REGEX "/BlackSpace/.*\\.cpp$")
 else()
 	message(FATAL_ERROR "Unknown MOD_TARGET_GAME '${MOD_TARGET_GAME}'")
 endif()
