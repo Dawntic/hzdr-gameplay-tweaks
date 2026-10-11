@@ -57,8 +57,6 @@ namespace HRZR
 			if (ModConfiguration.RenderDoc.Diagnostics)
 			{
 				RenderDocDiag::Report("first Present");
-				RenderDocDiag::ReportLiveObjects(NxD3DImpl::GetSingleton(), Thisptr);
-				RenderDocDiag::ProbeCreation();
 			}
 
 			return RenderDoc::Api != nullptr;
@@ -102,8 +100,6 @@ namespace HRZR
 		{
 			auto *d3d = NxD3DImpl::GetSingleton();
 			auto *device = d3d->GetD3D12Device();
-
-			RenderDocDiag::ReportLiveObjects(d3d, Thisptr);
 
 			const auto vtable = *reinterpret_cast<void ***>(device);
 			spdlog::info(

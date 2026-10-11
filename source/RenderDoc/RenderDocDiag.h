@@ -18,14 +18,6 @@ namespace RenderDocDiag
 	// loaded so that we sit underneath RenderDoc's own IAT patches and observe every resolution attempt.
 	void InstallTraceHooks(bool Trace);
 
-	// Full snapshot: module load order, IAT ownership, export resolution truth table.
+	// Snapshot of the command line and the module load order.
 	void Report(const char *Phase);
-
-	// Actually create a throwaway device/factory through the exact code path the game uses, then report
-	// which module owns the returned vtables. This is the control experiment that splits
-	// "RenderDoc's hooks are dead" from "the game bypasses RenderDoc's hooks".
-	void ProbeCreation();
-
-	// Report the owning module of the vtables of the live objects the game is actually rendering with.
-	void ReportLiveObjects(void *NxD3DImplPtr, void *NxDXGIImplPtr);
 }

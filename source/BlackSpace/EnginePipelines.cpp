@@ -97,11 +97,6 @@ namespace CrimsonDesert::EnginePipelines
 			CopyName(nameId, name);
 		}
 
-		static std::atomic_uint32_t s_calls = 0;
-
-		if (const auto call = s_calls.fetch_add(1); call < 8 || (call & (call - 1)) == 0)
-			spdlog::info("[EnginePipelines] Build #{} (tid {}): pass \"{}\", pipeline \"{}\"", call, GetCurrentThreadId(), pass, name);
-
 		ShaderScopes::BeginEnginePipeline(pass, name, nullptr);
 		const auto result = OriginalBuildPipelineState(Pipeline, Arg2, Arg3, Arg4, Arg5, Arg6);
 		ShaderScopes::EndEnginePipeline();

@@ -14,7 +14,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 namespace ShaderScopes
@@ -329,7 +328,6 @@ namespace ShaderScopes
 	static thread_local std::optional<EngineNames> t_EngineContext;
 	static std::mutex g_EngineMutex;
 	static std::unordered_map<std::string, EngineNames> g_EngineByShaders;
-	static std::unordered_set<std::string> g_SeenPasses;
 
 	struct ListScopes
 	{
@@ -376,103 +374,16 @@ namespace ShaderScopes
 		if (!Pipeline || !*Pipeline)
 			return;
 
-		static std::atomic_uint32_t s_total = 0;
-		static std::atomic_uint32_t s_fromThread = 0;
-		static std::atomic_uint32_t s_fromShaders = 0;
-
 		PipelineInfo info { {}, std::move(Label) };
 		bool fromThisThread = false;
 
 		if (const auto engine = EngineNamesFor(ShaderKey, fromThisThread))
 		{
-			(fromThisThread ? s_fromThread : s_fromShaders)++;
 			info.Section = engine->Pass;
 
 			// The engine's own pipeline name leads, with the entry points kept for reference
 			if (!engine->Name.empty())
 				info.Label = info.Label.empty() ? engine->Name : std::format("{} [{}]", engine->Name, info.Label);
-
-			bool firstSighting = false;
-
-			if (!info.Section.empty())
-			{
-				std::lock_guard lock(g_EngineMutex);
-				firstSighting = g_SeenPasses.insert(info.Section).second;
-			}
-
-			if (firstSighting)
-				spdlog::info("[ShaderScopes] Render pass \"{}\"", info.Section);
-		}
-
-		// Enough to judge how well engine names are being matched, without logging every pipeline
-		if (const auto total = ++s_total; total == 64 || total == 512 || total % 2048 == 0)
-		{
-			const auto fromThread = s_fromThread.load();
-			const auto fromShaders = s_fromShaders.load();
-
-			spdlog::info(
-				"[ShaderScopes] {} pipelines created: {} matched to an engine pass on the same thread, {} by shader, {} unmatched",
-				total,
-				fromThread,
-				fromShaders,
-				total - fromThread - fromShaders);
-		}
-
-		// Who creates the pipelines that miss: the engine frames on the stack say which code path to hook. Only
-		// pipelines the exe asks for directly count (not FidelityFX, Streamline and the like), and each
-		// distinct call path is logged once.
-		static std::atomic_uint32_t s_tracedPaths = 0;
-
-		if (info.Section.empty() && s_tracedPaths.load() < 12)
-		{
-			void *frames[24] = {};
-			const auto count = RtlCaptureStackBackTrace(1, static_cast<DWORD>(std::size(frames)), frames, nullptr);
-			const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-
-			std::string trace;
-			std::string path;
-			bool sawExe = false;
-			bool thirdParty = false;
-			uint32_t exeFrames = 0;
-
-			for (USHORT i = 0; i < count; i++)
-			{
-				const auto owner = RenderDoc::OwnerOf(frames[i]);
-				const bool isExe = _stricmp(owner.c_str(), "CrimsonDesert.exe") == 0;
-
-				// Anything between our hook and the first exe frame other than the D3D12 layers means some
-				// middleware created this pipeline, not the engine
-				if (!sawExe && !isExe && _stricmp(owner.c_str(), "WINHTTP.dll") != 0 && _stricmp(owner.c_str(), "renderdoc.dll") != 0)
-					thirdParty = true;
-
-				sawExe |= isExe;
-
-				// Exe frames as preferred-base addresses so they match a disassembly of the file
-				if (isExe)
-				{
-					const auto address = reinterpret_cast<uintptr_t>(frames[i]) - exe + 0x140000000;
-					trace += std::format(" {:#x}", address);
-
-					if (exeFrames++ < 4)
-						path += std::format("{:x};", address);
-				}
-				else
-				{
-					trace += std::format(" {}", owner);
-				}
-			}
-
-			bool newPath = false;
-
-			if (sawExe && !thirdParty)
-			{
-				std::lock_guard lock(g_EngineMutex);
-				static std::unordered_set<std::string> s_paths;
-				newPath = s_paths.insert(path).second;
-			}
-
-			if (newPath && s_tracedPaths.fetch_add(1) < 12)
-				spdlog::info("[ShaderScopes] Unmatched pipeline \"{}\" (tid {}) created from:{}", info.Label, GetCurrentThreadId(), trace);
 		}
 
 		if (info.Section.empty() && info.Label.empty())
@@ -648,14 +559,6 @@ namespace ShaderScopes
 		if (hasList4)
 			Hooks::WriteVirtualFunction(table, setPipeline1Slot, &HookedSetPipelineState1);
 
-		spdlog::info(
-			"[ShaderScopes] Hooked command list vtable {:p} [{}] (Close={}, Reset={}, SetPipelineState={}, SetPipelineState1={})",
-			static_cast<void *>(vtable),
-			RenderDoc::OwnerOf(vtable[0]),
-			closeSlot,
-			resetSlot,
-			setPipelineSlot,
-			hasList4 ? std::to_string(setPipeline1Slot) : "n/a");
 	}
 
 	//
@@ -807,16 +710,6 @@ namespace ShaderScopes
 		if (hasDevice4)
 			Hooks::WriteVirtualFunction(table, list1Slot, &HookedCreateCommandList1);
 
-		spdlog::info(
-			"[ShaderScopes] Hooked device vtable {:p} [{}] (CreateGraphicsPipelineState={}, CreateComputePipelineState={}, CreateCommandList={}, "
-			"CreatePipelineState={}, CreateCommandList1={})",
-			static_cast<void *>(vtable),
-			RenderDoc::OwnerOf(vtable[0]),
-			graphicsSlot,
-			computeSlot,
-			listSlot,
-			hasDevice2 ? std::to_string(streamSlot) : "n/a",
-			hasDevice4 ? std::to_string(list1Slot) : "n/a");
 	}
 
 	static HRESULT WINAPI HookedD3D12CreateDevice(IUnknown *Adapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID Riid, void **Device)
