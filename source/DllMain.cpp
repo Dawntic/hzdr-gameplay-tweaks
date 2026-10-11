@@ -12,6 +12,14 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
 		fullModulePath.resize(len);
 
+#if defined(MOD_TARGET_EXE)
+		// Other executables next to the game import winhttp.dll too (crashpad_handler.exe does). Stay a plain
+		// proxy there: initializing would load RenderDoc into them and truncate the game's mod_log.txt.
+		// Export forwarding doesn't depend on this, it initializes from a TLS callback.
+		if (_wcsicmp(std::filesystem::path(fullModulePath).filename().c_str(), MOD_TARGET_EXE) != 0)
+			return TRUE;
+#endif
+
 		try
 		{
 			if (fullModulePath.empty())

@@ -27,6 +27,18 @@ file(
 	"${SOURCE_DIR}/*.cpp"
 )
 
+# Which game the DLL is built for. Everything that hooks Decima internals by signature (the NxDXGIImpl
+# Present hook, command list naming) only exists for HZDR. Other games get the engine-agnostic RenderDoc
+# setup only: early load, Streamline bypass, diagnostics.
+set(MOD_TARGET_GAME "HZDR" CACHE STRING "Game to build for: HZDR or CrimsonDesert")
+set_property(CACHE MOD_TARGET_GAME PROPERTY STRINGS HZDR CrimsonDesert)
+
+if(MOD_TARGET_GAME STREQUAL "CrimsonDesert")
+	list(FILTER SOURCE_FILES EXCLUDE REGEX "/HRZR/(Nx/.*|RenderPassNames)\\.cpp$")
+elseif(NOT MOD_TARGET_GAME STREQUAL "HZDR")
+	message(FATAL_ERROR "Unknown MOD_TARGET_GAME '${MOD_TARGET_GAME}'")
+endif()
+
 source_group(
 	TREE "${SOURCE_DIR}/.."
 	FILES
@@ -104,6 +116,8 @@ target_compile_definitions(
 		NOMINMAX
 		VC_EXTRALEAN
 		WIN32_LEAN_AND_MEAN
+		$<$<STREQUAL:${MOD_TARGET_GAME},CrimsonDesert>:MOD_GAME_CRIMSON_DESERT>
+		$<$<STREQUAL:${MOD_TARGET_GAME},CrimsonDesert>:MOD_TARGET_EXE=L"CrimsonDesert.exe">
 )
 
 #

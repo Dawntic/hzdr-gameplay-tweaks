@@ -62,6 +62,15 @@
       "inherits": [
         "configuration-final"
       ]
+    },
+    {
+      "name": "final-crimson-desert",
+      "inherits": [
+        "configuration-final"
+      ],
+      "cacheVariables": {
+        "MOD_TARGET_GAME": "CrimsonDesert"
+      }
     }
   ],
   "buildPresets": [
@@ -76,6 +85,18 @@
       "configurePreset": "final-universal",
       "configuration": "Release",
       "displayName": "Universal Release x64"
+    },
+    {
+      "name": "final-crimson-desert-debug",
+      "configurePreset": "final-crimson-desert",
+      "configuration": "Debug",
+      "displayName": "Crimson Desert Debug x64"
+    },
+    {
+      "name": "final-crimson-desert-release",
+      "configurePreset": "final-crimson-desert",
+      "configuration": "Release",
+      "displayName": "Crimson Desert Release x64"
     }
   ],
   "packagePresets": [

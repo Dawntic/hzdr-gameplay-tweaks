@@ -11,8 +11,11 @@
 #include <detours/detours.h>
 
 #include <filesystem>
+#include <format>
 #include <intrin.h>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace RenderDocDiag
 {
@@ -285,6 +288,37 @@ namespace RenderDocDiag
 		return result ? result : &::GetProcAddress;
 	}
 
+	// A GetProcAddress that RenderDoc intercepts, or null if none can be found. RenderDoc hooks by patching
+	// import tables, so any module's patched GetProcAddress slot will do. The exe's own slot isn't enough:
+	// in Crimson Desert it still holds the raw kernel32 export after RenderDoc loads (Denuvo is the likely
+	// culprit), so this mod's own import table, which RenderDoc patches too, is the fallback.
+	static decltype(&::GetProcAddress) GetRenderDocResolver()
+	{
+		HMODULE self = nullptr;
+		GetModuleHandleExW(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			reinterpret_cast<LPCWSTR>(&GetRenderDocResolver),
+			&self);
+
+		for (const auto module : { GetModuleHandleW(nullptr), self })
+		{
+			decltype(&::GetProcAddress) result = nullptr;
+
+			ForEachImport(
+				module,
+				[&](const char *Dll, const char *Func, void **Slot, bool)
+			{
+				if (!result && _stricmp(Func, "GetProcAddress") == 0 && OwnerOf(*Slot) == "renderdoc.dll")
+					result = reinterpret_cast<decltype(&::GetProcAddress)>(*Slot);
+			});
+
+			if (result)
+				return result;
+		}
+
+		return nullptr;
+	}
+
 	//
 	// Trace hooks
 	//
@@ -317,6 +351,17 @@ namespace RenderDocDiag
 				t_InTrace = false;
 		}
 	};
+
+	// Some callers resolve the same export every frame (the Steam overlay polls CreateDXGIFactory*), which
+	// buried the log in identical lines. Only the first occurrence of each lookup says anything new.
+	static bool FirstSighting(std::string Key)
+	{
+		static std::mutex lock;
+		static std::unordered_set<std::string> seen;
+
+		std::scoped_lock guard(lock);
+		return seen.insert(std::move(Key)).second;
+	}
 
 	//
 	// Streamline bypass.
@@ -361,6 +406,45 @@ namespace RenderDocDiag
 		return nullptr;
 	}
 
+	// Points the executable's static d3d12.dll / dxgi.dll imports at RenderDoc's hooks where they aren't
+	// already. If RenderDoc's import patches on the exe are missing, the game's own CreateDXGIFactory1/2 and
+	// D3D12GetInterface calls hand back unwrapped objects that then meet wrapped ones. Idempotent.
+	static void RepairExeImports(decltype(&::GetProcAddress) Resolver)
+	{
+		ForEachImport(
+			GetModuleHandleW(nullptr),
+			[&](const char *Dll, const char *Func, void **Slot, bool)
+		{
+			if (_stricmp(Dll, "d3d12.dll") != 0 && _stricmp(Dll, "dxgi.dll") != 0)
+				return;
+
+			const auto host = GetModuleHandleA(Dll);
+
+			if (!host || OwnerOf(*Slot) == "renderdoc.dll")
+				return;
+
+			const auto hooked = reinterpret_cast<void *>(Resolver(host, Func));
+
+			// RenderDoc doesn't hook everything (root signature serialization, say), and raw is correct there
+			if (!hooked || OwnerOf(hooked) != "renderdoc.dll")
+				return;
+
+			DWORD oldProtect = 0;
+
+			if (!VirtualProtect(Slot, sizeof(void *), PAGE_READWRITE, &oldProtect))
+			{
+				spdlog::error("[RDDiag] Cannot unprotect the exe import slot for {}!{}", Dll, Func);
+				return;
+			}
+
+			const auto previous = *Slot;
+			*Slot = hooked;
+			VirtualProtect(Slot, sizeof(void *), oldProtect, &oldProtect);
+
+			spdlog::info("[RDDiag] Exe import {}!{} was {:p} [{}], now RenderDoc's {:p}", Dll, Func, previous, OwnerOf(previous), hooked);
+		});
+	}
+
 	static bool IsStreamlineInterposer(HMODULE Module)
 	{
 		static HMODULE cached = nullptr;
@@ -391,9 +475,38 @@ namespace RenderDocDiag
 		if (!host)
 			return nullptr;
 
-		// Resolve through the executable's own resolver, which RenderDoc has patched. That returns
-		// RenderDoc's wrapper rather than the raw export.
-		static const auto resolver = GetExeResolver();
+		// Resolve through a GetProcAddress RenderDoc intercepts, so the game gets RenderDoc's creation hooks
+		// rather than the raw exports. Handing out a raw D3D12CreateDevice while RenderDoc wraps everything
+		// else leaves the game with an unwrapped device fed wrapped objects, which crashes inside the driver.
+		const bool renderDocLoaded = GetModuleHandleW(L"renderdoc.dll") != nullptr;
+		decltype(&::GetProcAddress) resolver = &::GetProcAddress;
+
+		if (renderDocLoaded)
+		{
+			static const auto renderDocResolver = []()
+			{
+				const auto result = GetRenderDocResolver();
+
+				TraceGuard guard;
+
+				if (guard.Entered)
+				{
+					if (result)
+						RepairExeImports(result);
+					else
+						spdlog::error("[RDDiag] Streamline bypass disabled: no GetProcAddress hooked by RenderDoc found");
+				}
+
+				return result;
+			}();
+
+			// Without RenderDoc's resolver, staying on Streamline's path is the only consistent option
+			if (!renderDocResolver)
+				return nullptr;
+
+			resolver = renderDocResolver;
+		}
+
 		const auto substitute = resolver(host, ProcName);
 
 		if (!substitute)
@@ -432,20 +545,27 @@ namespace RenderDocDiag
 
 			if (guard.Entered)
 			{
-				spdlog::info(
-					"[RDDiag] GetProcAddress({}, \"{}\") -> {:p} [{}]  caller={}",
-					OwnerOf(Module),
-					ProcName,
-					reinterpret_cast<void *>(result),
-					OwnerOf(reinterpret_cast<void *>(result)),
-					OwnerOf(_ReturnAddress()));
+				const auto module = OwnerOf(Module);
+				const auto owner = OwnerOf(reinterpret_cast<void *>(result));
+				const auto caller = OwnerOf(_ReturnAddress());
+
+				if (FirstSighting(std::format("gpa|{}|{}|{}|{}", module, ProcName, owner, caller)))
+				{
+					spdlog::info(
+						"[RDDiag] GetProcAddress({}, \"{}\") -> {:p} [{}]  caller={}",
+						module,
+						ProcName,
+						reinterpret_cast<void *>(result),
+						owner,
+						caller);
+				}
 			}
 		}
 
 		return result;
 	}
 
-	static void TraceLoad(const wchar_t *Name, HMODULE Result)
+	static void TraceLoad(const wchar_t *Name, HMODULE Result, void *ReturnAddress)
 	{
 		if (!Name || !s_Trace)
 			return;
@@ -458,13 +578,46 @@ namespace RenderDocDiag
 		TraceGuard guard;
 
 		if (guard.Entered)
-			spdlog::info("[RDDiag] LoadLibrary(\"{}\") -> {:p}  caller={}", Narrow(base), static_cast<void *>(Result), OwnerOf(_ReturnAddress()));
+		{
+			const auto caller = OwnerOf(ReturnAddress);
+
+			if (FirstSighting(std::format("load|{}|{}|{}", Narrow(base), static_cast<void *>(Result), caller)))
+				spdlog::info("[RDDiag] LoadLibrary(\"{}\") -> {:p}  caller={}", Narrow(base), static_cast<void *>(Result), caller);
+		}
+	}
+
+	// Graphics runtime loads only happen once the game itself is running, after anything that rewrites the
+	// exe's import table at startup has finished. That makes them the earliest dependable point to repair it.
+	static void RepairOnGraphicsLoad(const wchar_t *Name)
+	{
+		if (!s_BypassStreamline || !Name)
+			return;
+
+		const auto base = std::filesystem::path(Name).filename().wstring();
+
+		if (_wcsicmp(base.c_str(), L"d3d12.dll") != 0 && _wcsicmp(base.c_str(), L"D3D12Core.dll") != 0 &&
+			_wcsicmp(base.c_str(), L"dxgi.dll") != 0 && _wcsicmp(base.c_str(), L"sl.interposer.dll") != 0)
+			return;
+
+		if (!GetModuleHandleW(L"renderdoc.dll"))
+			return;
+
+		TraceGuard guard;
+
+		if (!guard.Entered)
+			return;
+
+		if (const auto resolver = GetRenderDocResolver())
+			RepairExeImports(resolver);
 	}
 
 	static HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR FileName, HANDLE File, DWORD Flags)
 	{
 		const auto result = OrigLoadLibraryExW(FileName, File, Flags);
-		TraceLoad(FileName, result);
+		TraceLoad(FileName, result, _ReturnAddress());
+
+		if (result)
+			RepairOnGraphicsLoad(FileName);
 
 		return result;
 	}
@@ -476,7 +629,10 @@ namespace RenderDocDiag
 		if (FileName)
 		{
 			const auto wide = std::filesystem::path(FileName).wstring();
-			TraceLoad(wide.c_str(), result);
+			TraceLoad(wide.c_str(), result, _ReturnAddress());
+
+			if (result)
+				RepairOnGraphicsLoad(wide.c_str());
 		}
 
 		return result;

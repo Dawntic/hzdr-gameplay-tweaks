@@ -121,7 +121,9 @@ namespace Offsets::detail
 #include "test.h"
 #include "ModConfiguration.h"
 #include "HRZR/RenderDocDiag.h"
+#if !defined(MOD_GAME_CRIMSON_DESERT)
 #include "HRZR/RenderPassNames.h"
+#endif
 RENDERDOC_API_1_7_0 *renderDocApi = nullptr;
 std::atomic_bool g_wantCapture = false;
 
@@ -142,6 +144,39 @@ bool EngineWillAttachRenderDoc()
 
 	return commandLine.find(L"-attach_renderdoc") != std::wstring::npos;
 }
+
+#if defined(MOD_GAME_CRIMSON_DESERT)
+// RenderDoc shares the ASCII range with Windows virtual keys but numbers everything else itself.
+// Returns eRENDERDOC_Key_Max for keys it can't express.
+static RENDERDOC_InputButton RenderDocKeyFromVirtualKey(int VirtualKey)
+{
+	if ((VirtualKey >= '0' && VirtualKey <= '9') || (VirtualKey >= 'A' && VirtualKey <= 'Z'))
+		return static_cast<RENDERDOC_InputButton>(VirtualKey);
+
+	if (VirtualKey >= VK_F1 && VirtualKey <= VK_F12)
+		return static_cast<RENDERDOC_InputButton>(eRENDERDOC_Key_F1 + (VirtualKey - VK_F1));
+
+	switch (VirtualKey)
+	{
+	case VK_DIVIDE: return eRENDERDOC_Key_Divide;
+	case VK_MULTIPLY: return eRENDERDOC_Key_Multiply;
+	case VK_SUBTRACT: return eRENDERDOC_Key_Subtract;
+	case VK_ADD: return eRENDERDOC_Key_Plus;
+	case VK_HOME: return eRENDERDOC_Key_Home;
+	case VK_END: return eRENDERDOC_Key_End;
+	case VK_INSERT: return eRENDERDOC_Key_Insert;
+	case VK_DELETE: return eRENDERDOC_Key_Delete;
+	case VK_PRIOR: return eRENDERDOC_Key_PageUp;
+	case VK_NEXT: return eRENDERDOC_Key_PageDn;
+	case VK_BACK: return eRENDERDOC_Key_Backspace;
+	case VK_TAB: return eRENDERDOC_Key_Tab;
+	case VK_SNAPSHOT: return eRENDERDOC_Key_PrtScrn;
+	case VK_PAUSE: return eRENDERDOC_Key_Pause;
+	}
+
+	return eRENDERDOC_Key_Max;
+}
+#endif
 
 static bool AcquireRenderDocApi(HMODULE Module)
 {
@@ -171,6 +206,22 @@ static bool AcquireRenderDocApi(HMODULE Module)
 
 		renderDocApi->SetCaptureFilePathTemplate(capturePath.string().c_str());
 	}
+
+#if defined(MOD_GAME_CRIMSON_DESERT)
+	// No engine Present hook on this game to poll the key from, so hand it to RenderDoc, which checks its
+	// capture keys on every present of the swapchain it wrapped.
+	if (const auto key = RenderDocKeyFromVirtualKey(ModConfiguration.RenderDoc.CaptureKey); key != eRENDERDOC_Key_Max)
+	{
+		RENDERDOC_InputButton keys[] = { key };
+		renderDocApi->SetCaptureKeys(keys, 1);
+
+		spdlog::info("[RenderDoc] Capture key set to VK 0x{:X}", ModConfiguration.RenderDoc.CaptureKey);
+	}
+	else if (ModConfiguration.RenderDoc.CaptureKey > 0)
+	{
+		spdlog::warn("[RenderDoc] CaptureKey 0x{:X} has no RenderDoc equivalent, keeping RenderDoc's defaults", ModConfiguration.RenderDoc.CaptureKey);
+	}
+#endif
 
 	spdlog::info("[RenderDoc] API acquired. Capture template: {}", renderDocApi->GetCaptureFilePathTemplate());
 	return true;
@@ -343,9 +394,11 @@ static NTSTATUS LdrLoadDllTail(PWSTR SearchPath, PULONG LoadFlags, PUNICODE_STRI
 		// the gate flag, and they have run by the time anything loads d3d12.dll. Waiting until the first
 		// Present is too late for anything named during renderer init - pooled render targets and buffers
 		// are constructed once, well before the first frame, and are never renamed.
+#if !defined(MOD_GAME_CRIMSON_DESERT)
 		if (NT_SUCCESS(Status) && ModConfiguration.RenderDoc.NameCommandLists &&
 			_wcsicmp(filename.c_str(), L"d3d12.dll") == 0)
 			HRZR::RenderPassNames::SetEnabled(true);
+#endif
 
 		// The engine's -attach_renderdoc handler asks the loader for renderdoc.dll and gives up quietly if
 		// it isn't where it expects. Rather than guessing that path, satisfy the request with the
