@@ -1,4 +1,5 @@
 #include "RenderDocDiag.h"
+#include "ShaderScopes.h"
 
 #define WIN32_NO_STATUS
 #include <Windows.h>
@@ -507,7 +508,7 @@ namespace RenderDocDiag
 			resolver = renderDocResolver;
 		}
 
-		const auto substitute = resolver(host, ProcName);
+		auto substitute = resolver(host, ProcName);
 
 		if (!substitute)
 			return nullptr;
@@ -524,6 +525,11 @@ namespace RenderDocDiag
 				reinterpret_cast<void *>(substitute),
 				OwnerOf(reinterpret_cast<void *>(substitute)));
 		}
+
+		// Every device the game creates comes through here, which is where the shader scopes find the
+		// vtables they need
+		if (ShaderScopes::IsEnabled() && _stricmp(ProcName, "D3D12CreateDevice") == 0)
+			substitute = ShaderScopes::WrapCreateDevice(substitute);
 
 		return substitute;
 	}

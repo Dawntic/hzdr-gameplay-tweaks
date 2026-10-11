@@ -24,6 +24,7 @@ namespace InternalModConfig
 			bool LogCommandListNames;
 			bool EmitPassMarkers;
 			bool WrapUnnamedLists;
+			bool ShaderMarkers;
 			int CaptureKey;
 			std::string DllPath;
 			std::string CapturePath;
